@@ -22,6 +22,7 @@
 #include "gc.h"
 #include "iostat.h"
 #include <trace/events/f2fs.h>
+#include "f2fs_printk.h"
 
 static struct kmem_cache *victim_entry_slab;
 
@@ -30,6 +31,7 @@ static unsigned int count_bits(const unsigned long *addr,
 
 static int gc_thread_func(void *data)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = data;
 	struct f2fs_gc_kthread *gc_th = sbi->gc_thread;
 	wait_queue_head_t *wq = &sbi->gc_thread->gc_wait_queue_head;
@@ -188,6 +190,7 @@ next:
 
 int f2fs_start_gc_thread(struct f2fs_sb_info *sbi)
 {
+	FUN_START();
 	struct f2fs_gc_kthread *gc_th;
 	dev_t dev = sbi->sb->s_bdev->bd_dev;
 
@@ -232,6 +235,7 @@ int f2fs_start_gc_thread(struct f2fs_sb_info *sbi)
 
 void f2fs_stop_gc_thread(struct f2fs_sb_info *sbi)
 {
+	FUN_START();
 	struct f2fs_gc_kthread *gc_th = sbi->gc_thread;
 
 	if (!gc_th)
@@ -244,6 +248,7 @@ void f2fs_stop_gc_thread(struct f2fs_sb_info *sbi)
 
 static int select_gc_type(struct f2fs_sb_info *sbi, int gc_type)
 {
+	FUN_START();
 	int gc_mode;
 
 	if (gc_type == BG_GC) {
@@ -276,6 +281,7 @@ static int select_gc_type(struct f2fs_sb_info *sbi, int gc_type)
 static void select_policy(struct f2fs_sb_info *sbi, int gc_type,
 			int type, struct victim_sel_policy *p)
 {
+	FUN_START();
 	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
 
 	if (p->alloc_mode == SSR) {
@@ -324,6 +330,7 @@ static void select_policy(struct f2fs_sb_info *sbi, int gc_type,
 static unsigned int get_max_cost(struct f2fs_sb_info *sbi,
 				struct victim_sel_policy *p)
 {
+	FUN_START();
 	/* SSR allocates in a segment unit */
 	if (p->alloc_mode == SSR)
 		return BLKS_PER_SEG(sbi);
@@ -343,6 +350,7 @@ static unsigned int get_max_cost(struct f2fs_sb_info *sbi,
 
 static unsigned int check_bg_victims(struct f2fs_sb_info *sbi)
 {
+	FUN_START();
 	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
 	unsigned int secno;
 
@@ -362,6 +370,7 @@ static unsigned int check_bg_victims(struct f2fs_sb_info *sbi)
 
 static unsigned int get_cb_cost(struct f2fs_sb_info *sbi, unsigned int segno)
 {
+	FUN_START();
 	struct sit_info *sit_i = SIT_I(sbi);
 	unsigned long long mtime = 0;
 	unsigned int vblocks;
@@ -391,6 +400,7 @@ static unsigned int get_cb_cost(struct f2fs_sb_info *sbi, unsigned int segno)
 static inline unsigned int get_gc_cost(struct f2fs_sb_info *sbi,
 			unsigned int segno, struct victim_sel_policy *p)
 {
+	FUN_START();
 	if (p->alloc_mode == SSR)
 		return get_seg_entry(sbi, segno)->ckpt_valid_blocks;
 
@@ -412,6 +422,7 @@ static inline unsigned int get_gc_cost(struct f2fs_sb_info *sbi,
 static unsigned int count_bits(const unsigned long *addr,
 				unsigned int offset, unsigned int len)
 {
+	FUN_START();
 	unsigned int end = offset + len, sum = 0;
 
 	while (offset < end) {
@@ -424,6 +435,7 @@ static unsigned int count_bits(const unsigned long *addr,
 static bool f2fs_check_victim_tree(struct f2fs_sb_info *sbi,
 				struct rb_root_cached *root)
 {
+	FUN_START();
 #ifdef CONFIG_F2FS_CHECK_FS
 	struct rb_node *cur = rb_first_cached(root), *next;
 	struct victim_entry *cur_ve, *next_ve;
@@ -451,6 +463,7 @@ static bool f2fs_check_victim_tree(struct f2fs_sb_info *sbi,
 static struct victim_entry *__lookup_victim_entry(struct f2fs_sb_info *sbi,
 					unsigned long long mtime)
 {
+	FUN_START();
 	struct atgc_management *am = &sbi->am;
 	struct rb_node *node = am->root.rb_root.rb_node;
 	struct victim_entry *ve = NULL;
@@ -469,6 +482,7 @@ static struct victim_entry *__lookup_victim_entry(struct f2fs_sb_info *sbi,
 static struct victim_entry *__create_victim_entry(struct f2fs_sb_info *sbi,
 		unsigned long long mtime, unsigned int segno)
 {
+	FUN_START();
 	struct atgc_management *am = &sbi->am;
 	struct victim_entry *ve;
 
@@ -486,6 +500,7 @@ static struct victim_entry *__create_victim_entry(struct f2fs_sb_info *sbi,
 static void __insert_victim_entry(struct f2fs_sb_info *sbi,
 				unsigned long long mtime, unsigned int segno)
 {
+	FUN_START();
 	struct atgc_management *am = &sbi->am;
 	struct rb_root_cached *root = &am->root;
 	struct rb_node **p = &root->rb_root.rb_node;
@@ -515,6 +530,7 @@ static void __insert_victim_entry(struct f2fs_sb_info *sbi,
 static void add_victim_entry(struct f2fs_sb_info *sbi,
 				struct victim_sel_policy *p, unsigned int segno)
 {
+	FUN_START();
 	struct sit_info *sit_i = SIT_I(sbi);
 	unsigned long long mtime = 0;
 
@@ -547,6 +563,7 @@ static void add_victim_entry(struct f2fs_sb_info *sbi,
 static void atgc_lookup_victim(struct f2fs_sb_info *sbi,
 						struct victim_sel_policy *p)
 {
+	FUN_START();
 	struct sit_info *sit_i = SIT_I(sbi);
 	struct atgc_management *am = &sbi->am;
 	struct rb_root_cached *root = &am->root;
@@ -620,6 +637,7 @@ skip:
 static void atssr_lookup_victim(struct f2fs_sb_info *sbi,
 						struct victim_sel_policy *p)
 {
+	FUN_START();
 	struct sit_info *sit_i = SIT_I(sbi);
 	struct atgc_management *am = &sbi->am;
 	struct victim_entry *ve;
@@ -684,6 +702,7 @@ skip_node:
 static void lookup_victim_by_age(struct f2fs_sb_info *sbi,
 						struct victim_sel_policy *p)
 {
+	FUN_START();
 	f2fs_bug_on(sbi, !f2fs_check_victim_tree(sbi, &sbi->am.root));
 
 	if (p->gc_mode == GC_AT)
@@ -696,6 +715,7 @@ static void lookup_victim_by_age(struct f2fs_sb_info *sbi,
 
 static void release_victim_entry(struct f2fs_sb_info *sbi)
 {
+	FUN_START();
 	struct atgc_management *am = &sbi->am;
 	struct victim_entry *ve, *tmp;
 
@@ -713,6 +733,7 @@ static void release_victim_entry(struct f2fs_sb_info *sbi)
 
 static bool f2fs_pin_section(struct f2fs_sb_info *sbi, unsigned int segno)
 {
+	FUN_START();
 	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
 	unsigned int secno = GET_SEC_FROM_SEG(sbi, segno);
 
@@ -725,12 +746,14 @@ static bool f2fs_pin_section(struct f2fs_sb_info *sbi, unsigned int segno)
 
 static bool f2fs_pinned_section_exists(struct dirty_seglist_info *dirty_i)
 {
+	FUN_START();
 	return dirty_i->pinned_secmap_cnt;
 }
 
 static bool f2fs_section_is_pinned(struct dirty_seglist_info *dirty_i,
 						unsigned int secno)
 {
+	FUN_START();
 	return dirty_i->enable_pin_section &&
 		f2fs_pinned_section_exists(dirty_i) &&
 		test_bit(secno, dirty_i->pinned_secmap);
@@ -738,6 +761,7 @@ static bool f2fs_section_is_pinned(struct dirty_seglist_info *dirty_i,
 
 static void f2fs_unpin_all_sections(struct f2fs_sb_info *sbi, bool enable)
 {
+	FUN_START();
 	unsigned int bitmap_size = f2fs_bitmap_size(MAIN_SECS(sbi));
 
 	if (f2fs_pinned_section_exists(DIRTY_I(sbi))) {
@@ -750,6 +774,7 @@ static void f2fs_unpin_all_sections(struct f2fs_sb_info *sbi, bool enable)
 static int f2fs_gc_pinned_control(struct inode *inode, int gc_type,
 							unsigned int segno)
 {
+	FUN_START();
 	if (!f2fs_is_pinned_file(inode))
 		return 0;
 	if (gc_type != FG_GC)
@@ -771,6 +796,7 @@ int f2fs_get_victim(struct f2fs_sb_info *sbi, unsigned int *result,
 			int gc_type, int type, char alloc_mode,
 			unsigned long long age, bool one_time)
 {
+	FUN_START();
 	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
 	struct sit_info *sm = SIT_I(sbi);
 	struct victim_sel_policy p;
@@ -969,6 +995,7 @@ out:
 
 static struct inode *find_gc_inode(struct gc_inode_list *gc_list, nid_t ino)
 {
+	FUN_START();
 	struct inode_entry *ie;
 
 	ie = radix_tree_lookup(&gc_list->iroot, ino);
@@ -979,6 +1006,7 @@ static struct inode *find_gc_inode(struct gc_inode_list *gc_list, nid_t ino)
 
 static void add_gc_inode(struct gc_inode_list *gc_list, struct inode *inode)
 {
+	FUN_START();
 	struct inode_entry *new_ie;
 
 	if (inode == find_gc_inode(gc_list, inode->i_ino)) {
@@ -995,6 +1023,7 @@ static void add_gc_inode(struct gc_inode_list *gc_list, struct inode *inode)
 
 static void put_gc_inode(struct gc_inode_list *gc_list)
 {
+	FUN_START();
 	struct inode_entry *ie, *next_ie;
 
 	list_for_each_entry_safe(ie, next_ie, &gc_list->ilist, list) {
@@ -1008,6 +1037,7 @@ static void put_gc_inode(struct gc_inode_list *gc_list)
 static int check_valid_map(struct f2fs_sb_info *sbi,
 				unsigned int segno, int offset)
 {
+	FUN_START();
 	struct sit_info *sit_i = SIT_I(sbi);
 	struct seg_entry *sentry;
 	int ret;
@@ -1027,6 +1057,7 @@ static int check_valid_map(struct f2fs_sb_info *sbi,
 static int gc_node_segment(struct f2fs_sb_info *sbi,
 		struct f2fs_summary *sum, unsigned int segno, int gc_type)
 {
+	FUN_START();
 	struct f2fs_summary *entry;
 	block_t start_addr;
 	int off;
@@ -1111,6 +1142,7 @@ next_step:
  */
 block_t f2fs_start_bidx_of_node(unsigned int node_ofs, struct inode *inode)
 {
+	FUN_START();
 	unsigned int indirect_blks = 2 * NIDS_PER_BLOCK + 4;
 	unsigned int bidx;
 
@@ -1134,6 +1166,7 @@ block_t f2fs_start_bidx_of_node(unsigned int node_ofs, struct inode *inode)
 static bool is_alive(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
 		struct node_info *dni, block_t blkaddr, unsigned int *nofs)
 {
+	FUN_START();
 	struct folio *node_folio;
 	nid_t nid;
 	unsigned int ofs_in_node, max_addrs, base;
@@ -1201,6 +1234,7 @@ static bool is_alive(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
 
 static int ra_data_block(struct inode *inode, pgoff_t index)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct address_space *mapping = f2fs_is_cow_file(inode) ?
 				F2FS_I(inode)->atomic_inode->i_mapping : inode->i_mapping;
@@ -1292,6 +1326,7 @@ put_folio:
 static int move_data_block(struct inode *inode, block_t bidx,
 				int gc_type, unsigned int segno, int off)
 {
+	FUN_START();
 	struct address_space *mapping = f2fs_is_cow_file(inode) ?
 				F2FS_I(inode)->atomic_inode->i_mapping : inode->i_mapping;
 	struct f2fs_io_info fio = {
@@ -1451,6 +1486,7 @@ out:
 static int move_data_page(struct inode *inode, block_t bidx, int gc_type,
 						unsigned int segno, int off)
 {
+	FUN_START();
 	struct folio *folio;
 	int err = 0;
 
@@ -1528,6 +1564,7 @@ static int gc_data_segment(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
 		struct gc_inode_list *gc_list, unsigned int segno, int gc_type,
 		bool force_migrate)
 {
+	FUN_START();
 	struct super_block *sb = sbi->sb;
 	struct f2fs_summary *entry;
 	block_t start_addr;
@@ -1703,6 +1740,7 @@ next_step:
 static int __get_victim(struct f2fs_sb_info *sbi, unsigned int *victim,
 			int gc_type, bool one_time)
 {
+	FUN_START();
 	struct sit_info *sit_i = SIT_I(sbi);
 	int ret;
 
@@ -1718,6 +1756,7 @@ static int do_garbage_collect(struct f2fs_sb_info *sbi,
 				struct gc_inode_list *gc_list, int gc_type,
 				bool force_migrate, bool one_time)
 {
+	FUN_START();
 	struct blk_plug plug;
 	unsigned int segno = start_segno;
 	unsigned int end_segno = start_segno + SEGS_PER_SEC(sbi);
@@ -1854,6 +1893,7 @@ skip:
 
 int f2fs_gc(struct f2fs_sb_info *sbi, struct f2fs_gc_control *gc_control)
 {
+	FUN_START();
 	int gc_type = gc_control->init_gc_type;
 	unsigned int segno = gc_control->victim_segno;
 	int sec_freed = 0, seg_freed = 0, total_freed = 0, total_sec_freed = 0;
@@ -2008,6 +2048,7 @@ stop:
 
 int __init f2fs_create_garbage_collection_cache(void)
 {
+	FUN_START();
 	victim_entry_slab = f2fs_kmem_cache_create("f2fs_victim_entry",
 					sizeof(struct victim_entry));
 	return victim_entry_slab ? 0 : -ENOMEM;
@@ -2015,11 +2056,13 @@ int __init f2fs_create_garbage_collection_cache(void)
 
 void f2fs_destroy_garbage_collection_cache(void)
 {
+	FUN_START();
 	kmem_cache_destroy(victim_entry_slab);
 }
 
 static void init_atgc_management(struct f2fs_sb_info *sbi)
 {
+	FUN_START();
 	struct atgc_management *am = &sbi->am;
 
 	if (test_opt(sbi, ATGC) &&
@@ -2038,6 +2081,7 @@ static void init_atgc_management(struct f2fs_sb_info *sbi)
 
 void f2fs_build_gc_manager(struct f2fs_sb_info *sbi)
 {
+	FUN_START();
 	sbi->gc_pin_file_threshold = DEF_GC_FAILED_PINNED_FILES;
 
 	/* give warm/cold data area from slower device */
@@ -2052,6 +2096,7 @@ int f2fs_gc_range(struct f2fs_sb_info *sbi,
 		unsigned int start_seg, unsigned int end_seg,
 		bool dry_run, unsigned int dry_run_sections)
 {
+	FUN_START();
 	unsigned int segno;
 	unsigned int gc_secs = dry_run_sections;
 
@@ -2086,6 +2131,7 @@ int f2fs_gc_range(struct f2fs_sb_info *sbi,
 static int free_segment_range(struct f2fs_sb_info *sbi,
 				unsigned int secs, bool dry_run)
 {
+	FUN_START();
 	unsigned int next_inuse, start, end;
 	struct cp_control cpc = { CP_RESIZE, 0, 0, 0 };
 	int gc_mode, gc_type;
@@ -2137,6 +2183,7 @@ out:
 
 static void update_sb_metadata(struct f2fs_sb_info *sbi, int secs)
 {
+	FUN_START();
 	struct f2fs_super_block *raw_sb = F2FS_RAW_SUPER(sbi);
 	int section_count;
 	int segment_count;
@@ -2170,6 +2217,7 @@ static void update_sb_metadata(struct f2fs_sb_info *sbi, int secs)
 
 static void update_fs_metadata(struct f2fs_sb_info *sbi, int secs)
 {
+	FUN_START();
 	int segs = secs * SEGS_PER_SEC(sbi);
 	long long blks = SEGS_TO_BLKS(sbi, segs);
 	long long user_block_count =
@@ -2198,6 +2246,7 @@ static void update_fs_metadata(struct f2fs_sb_info *sbi, int secs)
 
 int f2fs_resize_fs(struct file *filp, __u64 block_count)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(file_inode(filp));
 	__u64 old_block_count, shrunk_blocks;
 	struct cp_control cpc = { CP_RESIZE, 0, 0, 0 };
