@@ -13,6 +13,7 @@
 #include "f2fs.h"
 #include "iostat.h"
 #include <trace/events/f2fs.h>
+#include "f2fs_printk.h"
 
 static struct kmem_cache *bio_iostat_ctx_cache;
 static mempool_t *bio_iostat_ctx_pool;
@@ -20,6 +21,7 @@ static mempool_t *bio_iostat_ctx_pool;
 static inline unsigned long long iostat_get_avg_bytes(struct f2fs_sb_info *sbi,
 	enum iostat_type type)
 {
+	FUN_START();
 	return sbi->iostat_count[type] ? div64_u64(sbi->iostat_bytes[type],
 		sbi->iostat_count[type]) : 0;
 }
@@ -32,6 +34,7 @@ static inline unsigned long long iostat_get_avg_bytes(struct f2fs_sb_info *sbi,
 
 int __maybe_unused iostat_info_seq_show(struct seq_file *seq, void *offset)
 {
+	FUN_START();
 	struct super_block *sb = seq->private;
 	struct f2fs_sb_info *sbi = F2FS_SB(sb);
 
@@ -87,6 +90,7 @@ int __maybe_unused iostat_info_seq_show(struct seq_file *seq, void *offset)
 
 static inline void __record_iostat_latency(struct f2fs_sb_info *sbi)
 {
+	FUN_START();
 	int io, idx;
 	struct f2fs_iostat_latency iostat_lat[MAX_IO_TYPE][NR_PAGE_TYPE];
 	struct iostat_lat_info *io_lat = sbi->iostat_io_lat;
@@ -112,6 +116,7 @@ static inline void __record_iostat_latency(struct f2fs_sb_info *sbi)
 
 static inline void f2fs_record_iostat(struct f2fs_sb_info *sbi)
 {
+	FUN_START();
 	unsigned long long iostat_diff[NR_IO_TYPE];
 	int i;
 	unsigned long flags;
@@ -142,6 +147,7 @@ static inline void f2fs_record_iostat(struct f2fs_sb_info *sbi)
 
 void f2fs_reset_iostat(struct f2fs_sb_info *sbi)
 {
+	FUN_START();
 	struct iostat_lat_info *io_lat = sbi->iostat_io_lat;
 	int i;
 
@@ -161,6 +167,7 @@ void f2fs_reset_iostat(struct f2fs_sb_info *sbi)
 static inline void __f2fs_update_iostat(struct f2fs_sb_info *sbi,
 			enum iostat_type type, unsigned long long io_bytes)
 {
+	FUN_START();
 	sbi->iostat_bytes[type] += io_bytes;
 	sbi->iostat_count[type]++;
 }
@@ -168,6 +175,7 @@ static inline void __f2fs_update_iostat(struct f2fs_sb_info *sbi,
 void f2fs_update_iostat(struct f2fs_sb_info *sbi, struct inode *inode,
 			enum iostat_type type, unsigned long long io_bytes)
 {
+	FUN_START();
 	unsigned long flags;
 
 	if (!sbi->iostat_enable)
@@ -207,11 +215,13 @@ void f2fs_update_iostat(struct f2fs_sb_info *sbi, struct inode *inode,
 	spin_unlock_irqrestore(&sbi->iostat_lock, flags);
 
 	f2fs_record_iostat(sbi);
+	FUN_END();
 }
 
 static inline void __update_iostat_latency(struct bio_iostat_ctx *iostat_ctx,
 				enum iostat_lat_type lat_type)
 {
+	FUN_START();
 	unsigned long ts_diff;
 	unsigned int page_type = iostat_ctx->type;
 	struct f2fs_sb_info *sbi = iostat_ctx->sbi;
@@ -239,6 +249,7 @@ static inline void __update_iostat_latency(struct bio_iostat_ctx *iostat_ctx,
 
 void iostat_update_and_unbind_ctx(struct bio *bio)
 {
+	FUN_START();
 	struct bio_iostat_ctx *iostat_ctx = bio->bi_private;
 	enum iostat_lat_type lat_type;
 
@@ -258,6 +269,7 @@ void iostat_update_and_unbind_ctx(struct bio *bio)
 void iostat_alloc_and_bind_ctx(struct f2fs_sb_info *sbi,
 		struct bio *bio, struct bio_post_read_ctx *ctx)
 {
+	FUN_START();
 	struct bio_iostat_ctx *iostat_ctx;
 	/* Due to the mempool, this never fails. */
 	iostat_ctx = mempool_alloc(bio_iostat_ctx_pool, GFP_NOFS);
@@ -270,6 +282,7 @@ void iostat_alloc_and_bind_ctx(struct f2fs_sb_info *sbi,
 
 int __init f2fs_init_iostat_processing(void)
 {
+	FUN_START();
 	bio_iostat_ctx_cache =
 		kmem_cache_create("f2fs_bio_iostat_ctx",
 				  sizeof(struct bio_iostat_ctx), 0, 0, NULL);
@@ -290,12 +303,14 @@ fail:
 
 void f2fs_destroy_iostat_processing(void)
 {
+	FUN_START();
 	mempool_destroy(bio_iostat_ctx_pool);
 	kmem_cache_destroy(bio_iostat_ctx_cache);
 }
 
 int f2fs_init_iostat(struct f2fs_sb_info *sbi)
 {
+	FUN_START();
 	/* init iostat info */
 	spin_lock_init(&sbi->iostat_lock);
 	spin_lock_init(&sbi->iostat_lat_lock);
@@ -311,5 +326,6 @@ int f2fs_init_iostat(struct f2fs_sb_info *sbi)
 
 void f2fs_destroy_iostat(struct f2fs_sb_info *sbi)
 {
+	FUN_START();
 	kfree(sbi->iostat_io_lat);
 }
