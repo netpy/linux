@@ -19,6 +19,7 @@
 #include "node.h"
 #include "segment.h"
 #include "gc.h"
+#include "f2fs_printk.h"
 
 static LIST_HEAD(f2fs_stat_list);
 static DEFINE_RAW_SPINLOCK(f2fs_stat_lock);
@@ -31,6 +32,7 @@ static struct dentry *f2fs_debugfs_root;
  */
 void f2fs_update_sit_info(struct f2fs_sb_info *sbi)
 {
+	FUN_START();
 	struct f2fs_stat_info *si = F2FS_STAT(sbi);
 	unsigned long long blks_per_sec, hblks_per_sec, total_vblocks;
 	unsigned long long bimodal, dist;
@@ -62,6 +64,7 @@ void f2fs_update_sit_info(struct f2fs_sb_info *sbi)
 #ifdef CONFIG_DEBUG_FS
 static void update_multidevice_stats(struct f2fs_sb_info *sbi)
 {
+	FUN_START();
 	struct f2fs_stat_info *si = F2FS_STAT(sbi);
 	struct f2fs_dev_stats *dev_stats = si->dev_stats;
 	int i, j;
@@ -126,6 +129,7 @@ static void update_multidevice_stats(struct f2fs_sb_info *sbi)
 
 static void update_general_status(struct f2fs_sb_info *sbi)
 {
+	FUN_START();
 	struct f2fs_stat_info *si = F2FS_STAT(sbi);
 	struct f2fs_super_block *raw_super = F2FS_RAW_SUPER(sbi);
 	int i;
@@ -297,6 +301,7 @@ static void update_general_status(struct f2fs_sb_info *sbi)
  */
 static void update_mem_info(struct f2fs_sb_info *sbi)
 {
+	FUN_START();
 	struct f2fs_stat_info *si = F2FS_STAT(sbi);
 	int i;
 
@@ -437,6 +442,7 @@ static const char *ipu_mode_names[F2FS_IPU_MAX] = {
 
 static int stat_show(struct seq_file *s, void *v)
 {
+	FUN_START();
 	struct f2fs_stat_info *si;
 	int i = 0, j = 0;
 	unsigned long flags;
@@ -762,6 +768,7 @@ DEFINE_SHOW_ATTRIBUTE(stat);
 
 int f2fs_build_stats(struct f2fs_sb_info *sbi)
 {
+	FUN_START();
 	struct f2fs_super_block *raw_super = F2FS_RAW_SUPER(sbi);
 	struct f2fs_stat_info *si;
 	struct f2fs_dev_stats *dev_stats;
@@ -826,6 +833,7 @@ int f2fs_build_stats(struct f2fs_sb_info *sbi)
 
 void f2fs_destroy_stats(struct f2fs_sb_info *sbi)
 {
+	FUN_START();
 	struct f2fs_stat_info *si = F2FS_STAT(sbi);
 	unsigned long flags;
 
@@ -839,6 +847,7 @@ void f2fs_destroy_stats(struct f2fs_sb_info *sbi)
 
 void __init f2fs_create_root_stats(void)
 {
+	FUN_START();
 #ifdef CONFIG_DEBUG_FS
 	f2fs_debugfs_root = debugfs_create_dir("f2fs", NULL);
 
@@ -849,6 +858,7 @@ void __init f2fs_create_root_stats(void)
 
 void f2fs_destroy_root_stats(void)
 {
+	FUN_START();
 #ifdef CONFIG_DEBUG_FS
 	debugfs_remove_recursive(f2fs_debugfs_root);
 	f2fs_debugfs_root = NULL;
