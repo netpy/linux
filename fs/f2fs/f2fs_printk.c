@@ -123,3 +123,24 @@ void print_f2fs_super_block(const struct f2fs_super_block *sb)
 	pr_info("  crc: 0x%x\n", le32_to_cpu(sb->crc));
     // kfree(vbuf);
 }
+
+/**
+ * print_filename_from_inode - 通过 inode 打印文件名
+ * @inode: 指向 struct inode 结构体的指针
+ *
+ * 此函数会遍历与 inode 关联的所有 dentry，打印出每个 dentry 对应的文件名。
+ * 由于一个 inode 可能有多个硬链接，所以可能会打印出多个文件名。
+ */
+void print_filename_from_inode(struct inode *inode)
+{
+    struct dentry *dentry;
+
+    // 遍历 inode 的 dentry 列表
+    hlist_for_each_entry(dentry, &inode->i_dentry, d_u.d_alias)
+    {
+        // 打印文件名
+		if (dentry->d_name.name) {
+            pr_info("Filename: %.*s\n", (int)dentry->d_name.len, dentry->d_name.name);
+        }
+    }
+}
