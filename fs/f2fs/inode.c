@@ -16,6 +16,7 @@
 #include "node.h"
 #include "segment.h"
 #include "xattr.h"
+#include "f2fs_printk.h"
 
 #include <trace/events/f2fs.h>
 
@@ -25,6 +26,7 @@ extern const struct address_space_operations f2fs_compress_aops;
 
 void f2fs_mark_inode_dirty_sync(struct inode *inode, bool sync)
 {
+	FUN_START();
 	if (is_inode_flag_set(inode, FI_NEW_INODE))
 		return;
 
@@ -44,6 +46,7 @@ void f2fs_mark_inode_dirty_sync(struct inode *inode, bool sync)
 
 void f2fs_set_inode_flags(struct inode *inode)
 {
+	FUN_START();
 	unsigned int flags = F2FS_I(inode)->i_flags;
 	unsigned int new_fl = 0;
 
@@ -70,6 +73,7 @@ void f2fs_set_inode_flags(struct inode *inode)
 
 static void __get_inode_rdev(struct inode *inode, struct folio *node_folio)
 {
+	FUN_START();
 	__le32 *addr = get_dnode_addr(inode, node_folio);
 
 	if (S_ISCHR(inode->i_mode) || S_ISBLK(inode->i_mode) ||
@@ -83,6 +87,7 @@ static void __get_inode_rdev(struct inode *inode, struct folio *node_folio)
 
 static void __set_inode_rdev(struct inode *inode, struct folio *node_folio)
 {
+	FUN_START();
 	__le32 *addr = get_dnode_addr(inode, node_folio);
 
 	if (S_ISCHR(inode->i_mode) || S_ISBLK(inode->i_mode)) {
@@ -99,6 +104,7 @@ static void __set_inode_rdev(struct inode *inode, struct folio *node_folio)
 
 static void __recover_inline_status(struct inode *inode, struct folio *ifolio)
 {
+	FUN_START();
 	void *inline_data = inline_data_addr(inode, ifolio);
 	__le32 *start = inline_data;
 	__le32 *end = start + MAX_INLINE_DATA(inode) / sizeof(__le32);
@@ -118,6 +124,7 @@ static void __recover_inline_status(struct inode *inode, struct folio *ifolio)
 
 static bool f2fs_enable_inode_chksum(struct f2fs_sb_info *sbi, struct page *page)
 {
+	FUN_START();
 	struct f2fs_inode *ri = &F2FS_NODE(page)->i;
 
 	if (!f2fs_sb_has_inode_chksum(sbi))
@@ -130,11 +137,13 @@ static bool f2fs_enable_inode_chksum(struct f2fs_sb_info *sbi, struct page *page
 				i_inode_checksum))
 		return false;
 
+	FUN_END();
 	return true;
 }
 
 static __u32 f2fs_inode_chksum(struct f2fs_sb_info *sbi, struct page *page)
 {
+	FUN_START();
 	struct f2fs_node *node = F2FS_NODE(page);
 	struct f2fs_inode *ri = &node->i;
 	__le32 ino = node->footer.ino;
@@ -157,6 +166,7 @@ static __u32 f2fs_inode_chksum(struct f2fs_sb_info *sbi, struct page *page)
 
 bool f2fs_inode_chksum_verify(struct f2fs_sb_info *sbi, struct folio *folio)
 {
+	FUN_START();
 	struct f2fs_inode *ri;
 	__u32 provided, calculated;
 
@@ -181,11 +191,13 @@ bool f2fs_inode_chksum_verify(struct f2fs_sb_info *sbi, struct folio *folio)
 			  folio->index, ino_of_node(&folio->page),
 			  provided, calculated);
 
+	FUN_END();
 	return provided == calculated;
 }
 
 void f2fs_inode_chksum_set(struct f2fs_sb_info *sbi, struct page *page)
 {
+	FUN_START();
 	struct f2fs_inode *ri = &F2FS_NODE(page)->i;
 
 	if (!f2fs_enable_inode_chksum(sbi, page))
@@ -197,6 +209,7 @@ void f2fs_inode_chksum_set(struct f2fs_sb_info *sbi, struct page *page)
 static bool sanity_check_compress_inode(struct inode *inode,
 			struct f2fs_inode *ri)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	unsigned char clevel;
 
@@ -268,6 +281,7 @@ err_level:
 
 static bool sanity_check_inode(struct inode *inode, struct page *node_page)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	struct f2fs_inode *ri = F2FS_INODE(node_page);
@@ -396,6 +410,7 @@ static bool sanity_check_inode(struct inode *inode, struct page *node_page)
 
 static void init_idisk_time(struct inode *inode)
 {
+	FUN_START();
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 
 	fi->i_disk_time[0] = inode_get_atime(inode);
@@ -405,6 +420,7 @@ static void init_idisk_time(struct inode *inode)
 
 static int do_read_inode(struct inode *inode)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	struct folio *node_folio;
@@ -554,12 +570,14 @@ static int do_read_inode(struct inode *inode)
 
 static bool is_meta_ino(struct f2fs_sb_info *sbi, unsigned int ino)
 {
+	FUN_START();
 	return ino == F2FS_NODE_INO(sbi) || ino == F2FS_META_INO(sbi) ||
 		ino == F2FS_COMPRESS_INO(sbi);
 }
 
 struct inode *f2fs_iget(struct super_block *sb, unsigned long ino)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_SB(sb);
 	struct inode *inode;
 	int ret = 0;
@@ -646,6 +664,7 @@ bad_inode:
 
 struct inode *f2fs_iget_retry(struct super_block *sb, unsigned long ino)
 {
+	FUN_START();
 	struct inode *inode;
 retry:
 	inode = f2fs_iget(sb, ino);
@@ -660,6 +679,7 @@ retry:
 
 void f2fs_update_inode(struct inode *inode, struct folio *node_folio)
 {
+	FUN_START();
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	struct f2fs_inode *ri;
 	struct extent_tree *et = fi->extent_tree[EX_READ];
@@ -758,6 +778,7 @@ void f2fs_update_inode(struct inode *inode, struct folio *node_folio)
 
 void f2fs_update_inode_page(struct inode *inode)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct folio *node_folio;
 	int count = 0;
@@ -785,6 +806,7 @@ stop_checkpoint:
 
 int f2fs_write_inode(struct inode *inode, struct writeback_control *wbc)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 
 	if (inode->i_ino == F2FS_NODE_INO(sbi) ||
@@ -822,6 +844,7 @@ int f2fs_write_inode(struct inode *inode, struct writeback_control *wbc)
 
 static void f2fs_remove_donate_inode(struct inode *inode)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 
 	if (list_empty(&F2FS_I(inode)->gdonate_list))
@@ -838,6 +861,7 @@ static void f2fs_remove_donate_inode(struct inode *inode)
  */
 void f2fs_evict_inode(struct inode *inode)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	nid_t xnid = fi->i_xattr_nid;
@@ -983,6 +1007,7 @@ out_clear:
 /* caller should call f2fs_lock_op() */
 void f2fs_handle_failed_inode(struct inode *inode)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct node_info ni;
 	int err;
