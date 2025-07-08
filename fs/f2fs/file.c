@@ -34,9 +34,11 @@
 #include "iostat.h"
 #include <trace/events/f2fs.h>
 #include <uapi/linux/f2fs.h>
+#include "f2fs_printk.h"
 
 static void f2fs_zero_post_eof_page(struct inode *inode, loff_t new_size)
 {
+	FUN_START();
 	loff_t old_size = i_size_read(inode);
 
 	if (old_size >= new_size)
@@ -48,6 +50,7 @@ static void f2fs_zero_post_eof_page(struct inode *inode, loff_t new_size)
 
 static vm_fault_t f2fs_filemap_fault(struct vm_fault *vmf)
 {
+	FUN_START();
 	struct inode *inode = file_inode(vmf->vma->vm_file);
 	vm_flags_t flags = vmf->vma->vm_flags;
 	vm_fault_t ret;
@@ -64,6 +67,7 @@ static vm_fault_t f2fs_filemap_fault(struct vm_fault *vmf)
 
 static vm_fault_t f2fs_vm_page_mkwrite(struct vm_fault *vmf)
 {
+	FUN_START();
 	struct folio *folio = page_folio(vmf->page);
 	struct inode *inode = file_inode(vmf->vma->vm_file);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
@@ -190,6 +194,7 @@ static const struct vm_operations_struct f2fs_file_vm_ops = {
 
 static int get_parent_ino(struct inode *inode, nid_t *pino)
 {
+	FUN_START();
 	struct dentry *dentry;
 
 	/*
@@ -207,6 +212,7 @@ static int get_parent_ino(struct inode *inode, nid_t *pino)
 
 static inline enum cp_reason_type need_do_checkpoint(struct inode *inode)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	enum cp_reason_type cp_reason = CP_NO_NEEDED;
 
@@ -242,6 +248,7 @@ static inline enum cp_reason_type need_do_checkpoint(struct inode *inode)
 
 static bool need_inode_page_update(struct f2fs_sb_info *sbi, nid_t ino)
 {
+	FUN_START();
 	struct folio *i = filemap_get_folio(NODE_MAPPING(sbi), ino);
 	bool ret = false;
 	/* But we need to avoid that there are some inode updates */
@@ -254,6 +261,7 @@ static bool need_inode_page_update(struct f2fs_sb_info *sbi, nid_t ino)
 
 static void try_to_fix_pino(struct inode *inode)
 {
+	FUN_START();
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	nid_t pino;
 
@@ -269,6 +277,7 @@ static void try_to_fix_pino(struct inode *inode)
 static int f2fs_do_sync_file(struct file *file, loff_t start, loff_t end,
 						int datasync, bool atomic)
 {
+	FUN_START();
 	struct inode *inode = file->f_mapping->host;
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	nid_t ino = inode->i_ino;
@@ -406,6 +415,7 @@ out:
 
 int f2fs_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
 {
+	FUN_START();
 	if (unlikely(f2fs_cp_error(F2FS_I_SB(file_inode(file)))))
 		return -EIO;
 	return f2fs_do_sync_file(file, start, end, datasync, false);
@@ -414,6 +424,7 @@ int f2fs_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
 static bool __found_offset(struct address_space *mapping,
 		struct dnode_of_data *dn, pgoff_t index, int whence)
 {
+	FUN_START();
 	block_t blkaddr = f2fs_data_blkaddr(dn);
 	struct inode *inode = mapping->host;
 	bool compressed_cluster = false;
@@ -447,6 +458,7 @@ static bool __found_offset(struct address_space *mapping,
 
 static loff_t f2fs_seek_block(struct file *file, loff_t offset, int whence)
 {
+	FUN_START();
 	struct inode *inode = file->f_mapping->host;
 	loff_t maxbytes = F2FS_BLK_TO_BYTES(max_file_blocks(inode));
 	struct dnode_of_data dn;
@@ -529,6 +541,7 @@ fail:
 
 static loff_t f2fs_llseek(struct file *file, loff_t offset, int whence)
 {
+	FUN_START();
 	struct inode *inode = file->f_mapping->host;
 	loff_t maxbytes = F2FS_BLK_TO_BYTES(max_file_blocks(inode));
 
@@ -550,6 +563,7 @@ static loff_t f2fs_llseek(struct file *file, loff_t offset, int whence)
 
 static int f2fs_file_mmap(struct file *file, struct vm_area_struct *vma)
 {
+	FUN_START();
 	struct inode *inode = file_inode(file);
 
 	if (unlikely(f2fs_cp_error(F2FS_I_SB(inode))))
@@ -570,6 +584,7 @@ static int f2fs_file_mmap(struct file *file, struct vm_area_struct *vma)
 
 static int finish_preallocate_blocks(struct inode *inode)
 {
+	FUN_START();
 	int ret = 0;
 	bool opened;
 
@@ -604,11 +619,13 @@ out_update:
 	f2fs_up_write(&F2FS_I(inode)->i_sem);
 out_unlock:
 	inode_unlock(inode);
+	FUN_END();
 	return ret;
 }
 
 static int f2fs_file_open(struct inode *inode, struct file *filp)
 {
+	FUN_START();
 	int err = fscrypt_file_open(inode, filp);
 
 	if (err)
@@ -627,12 +644,13 @@ static int f2fs_file_open(struct inode *inode, struct file *filp)
 	err = dquot_file_open(inode, filp);
 	if (err)
 		return err;
-
+	FUN_END();
 	return finish_preallocate_blocks(inode);
 }
 
 void f2fs_truncate_data_blocks_range(struct dnode_of_data *dn, int count)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dn->inode);
 	int nr_free = 0, ofs = dn->ofs_in_node, len = count;
 	__le32 *addr;
@@ -723,6 +741,7 @@ next:
 static int truncate_partial_data_page(struct inode *inode, u64 from,
 								bool cache_only)
 {
+	FUN_START();
 	loff_t offset = from & (PAGE_SIZE - 1);
 	pgoff_t index = from >> PAGE_SHIFT;
 	struct address_space *mapping = inode->i_mapping;
@@ -758,6 +777,7 @@ truncate_out:
 
 int f2fs_do_truncate_blocks(struct inode *inode, u64 from, bool lock)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct dnode_of_data dn;
 	pgoff_t free_from;
@@ -841,6 +861,7 @@ out_err:
 
 int f2fs_truncate_blocks(struct inode *inode, u64 from, bool lock)
 {
+	FUN_START();
 	u64 free_from = from;
 	int err;
 
@@ -879,6 +900,7 @@ int f2fs_truncate_blocks(struct inode *inode, u64 from, bool lock)
 
 int f2fs_truncate(struct inode *inode)
 {
+	FUN_START();
 	int err;
 
 	if (unlikely(f2fs_cp_error(F2FS_I_SB(inode))))
@@ -915,6 +937,7 @@ int f2fs_truncate(struct inode *inode)
 
 static bool f2fs_force_buffered_io(struct inode *inode, int rw)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 
 	if (!fscrypt_dio_supported(inode))
@@ -949,6 +972,7 @@ static bool f2fs_force_buffered_io(struct inode *inode, int rw)
 int f2fs_getattr(struct mnt_idmap *idmap, const struct path *path,
 		 struct kstat *stat, u32 request_mask, unsigned int query_flags)
 {
+	FUN_START();
 	struct inode *inode = d_inode(path->dentry);
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	struct f2fs_inode *ri = NULL;
@@ -1015,6 +1039,7 @@ int f2fs_getattr(struct mnt_idmap *idmap, const struct path *path,
 static void __setattr_copy(struct mnt_idmap *idmap,
 			   struct inode *inode, const struct iattr *attr)
 {
+	FUN_START();
 	unsigned int ia_valid = attr->ia_valid;
 
 	i_uid_update(idmap, attr, inode);
@@ -1040,6 +1065,7 @@ static void __setattr_copy(struct mnt_idmap *idmap,
 int f2fs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		 struct iattr *attr)
 {
+	FUN_START();
 	struct inode *inode = d_inode(dentry);
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	int err;
@@ -1181,6 +1207,7 @@ const struct inode_operations f2fs_file_inode_operations = {
 static int fill_zero(struct inode *inode, pgoff_t index,
 					loff_t start, loff_t len)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct folio *folio;
 
@@ -1205,6 +1232,7 @@ static int fill_zero(struct inode *inode, pgoff_t index,
 
 int f2fs_truncate_hole(struct inode *inode, pgoff_t pg_start, pgoff_t pg_end)
 {
+	FUN_START();
 	int err;
 
 	while (pg_start < pg_end) {
@@ -1237,6 +1265,7 @@ int f2fs_truncate_hole(struct inode *inode, pgoff_t pg_start, pgoff_t pg_end)
 
 static int f2fs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 {
+	FUN_START();
 	pgoff_t pg_start, pg_end;
 	loff_t off_start, off_end;
 	int ret;
@@ -1302,6 +1331,7 @@ static int f2fs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 static int __read_out_blkaddrs(struct inode *inode, block_t *blkaddr,
 				int *do_replace, pgoff_t off, pgoff_t len)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct dnode_of_data dn;
 	int ret, done, i;
@@ -1357,6 +1387,7 @@ next:
 static int __roll_back_blkaddrs(struct inode *inode, block_t *blkaddr,
 				int *do_replace, pgoff_t off, int len)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct dnode_of_data dn;
 	int ret, i;
@@ -1382,6 +1413,7 @@ static int __clone_blkaddrs(struct inode *src_inode, struct inode *dst_inode,
 			block_t *blkaddr, int *do_replace,
 			pgoff_t src, pgoff_t dst, pgoff_t len, bool full)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(src_inode);
 	pgoff_t i = 0;
 	int ret;
@@ -1470,6 +1502,7 @@ static int __exchange_data_block(struct inode *src_inode,
 			struct inode *dst_inode, pgoff_t src, pgoff_t dst,
 			pgoff_t len, bool full)
 {
+	FUN_START();
 	block_t *src_blkaddr;
 	int *do_replace;
 	pgoff_t olen;
@@ -1520,6 +1553,7 @@ roll_back:
 
 static int f2fs_do_collapse(struct inode *inode, loff_t offset, loff_t len)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	pgoff_t nrpages = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
 	pgoff_t start = offset >> PAGE_SHIFT;
@@ -1547,6 +1581,7 @@ static int f2fs_do_collapse(struct inode *inode, loff_t offset, loff_t len)
 
 static int f2fs_collapse_range(struct inode *inode, loff_t offset, loff_t len)
 {
+	FUN_START();
 	loff_t new_size;
 	int ret;
 
@@ -1586,6 +1621,7 @@ static int f2fs_collapse_range(struct inode *inode, loff_t offset, loff_t len)
 static int f2fs_do_zero_range(struct dnode_of_data *dn, pgoff_t start,
 								pgoff_t end)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dn->inode);
 	pgoff_t index = start;
 	unsigned int ofs_in_node = dn->ofs_in_node;
@@ -1636,6 +1672,7 @@ static int f2fs_do_zero_range(struct dnode_of_data *dn, pgoff_t start,
 static int f2fs_zero_range(struct inode *inode, loff_t offset, loff_t len,
 								int mode)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct address_space *mapping = inode->i_mapping;
 	pgoff_t index, pg_start, pg_end;
@@ -1747,6 +1784,7 @@ out:
 
 static int f2fs_insert_range(struct inode *inode, loff_t offset, loff_t len)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct address_space *mapping = inode->i_mapping;
 	pgoff_t nr, pg_start, pg_end, delta, idx;
@@ -1826,6 +1864,7 @@ static int f2fs_insert_range(struct inode *inode, loff_t offset, loff_t len)
 static int f2fs_expand_inode_data(struct inode *inode, loff_t offset,
 					loff_t len, int mode)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct f2fs_map_blocks map = { .m_next_pgofs = NULL,
 			.m_next_extent = NULL, .m_seg_type = NO_CHECK_TYPE,
@@ -1951,6 +1990,7 @@ out_err:
 static long f2fs_fallocate(struct file *file, int mode,
 				loff_t offset, loff_t len)
 {
+	FUN_START();
 	struct inode *inode = file_inode(file);
 	long ret = 0;
 
@@ -2027,6 +2067,7 @@ out:
 
 static int f2fs_release_file(struct inode *inode, struct file *filp)
 {
+	FUN_START();
 	/*
 	 * f2fs_release_file is called at every close calls. So we should
 	 * not drop any inmemory pages by close called by other process.
@@ -2039,11 +2080,13 @@ static int f2fs_release_file(struct inode *inode, struct file *filp)
 	f2fs_abort_atomic_write(inode, true);
 	inode_unlock(inode);
 
+	FUN_END();
 	return 0;
 }
 
 static int f2fs_file_flush(struct file *file, fl_owner_t id)
 {
+	FUN_START();
 	struct inode *inode = file_inode(file);
 
 	/*
@@ -2058,12 +2101,13 @@ static int f2fs_file_flush(struct file *file, fl_owner_t id)
 		f2fs_abort_atomic_write(inode, true);
 		inode_unlock(inode);
 	}
-
+	FUN_END();
 	return 0;
 }
 
 static int f2fs_setflags_common(struct inode *inode, u32 iflags, u32 mask)
 {
+	FUN_START();
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	u32 masked_flags = fi->i_flags & mask;
 
@@ -2189,6 +2233,7 @@ static const struct {
 /* Convert f2fs on-disk i_flags to FS_IOC_{GET,SET}FLAGS flags */
 static inline u32 f2fs_iflags_to_fsflags(u32 iflags)
 {
+	FUN_START();
 	u32 fsflags = 0;
 	int i;
 
@@ -2202,6 +2247,7 @@ static inline u32 f2fs_iflags_to_fsflags(u32 iflags)
 /* Convert FS_IOC_{GET,SET}FLAGS flags to f2fs on-disk i_flags */
 static inline u32 f2fs_fsflags_to_iflags(u32 fsflags)
 {
+	FUN_START();
 	u32 iflags = 0;
 	int i;
 
@@ -2214,6 +2260,7 @@ static inline u32 f2fs_fsflags_to_iflags(u32 fsflags)
 
 static int f2fs_ioc_getversion(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 
 	return put_user(inode->i_generation, (int __user *)arg);
@@ -2221,6 +2268,7 @@ static int f2fs_ioc_getversion(struct file *filp, unsigned long arg)
 
 static int f2fs_ioc_start_atomic_write(struct file *filp, bool truncate)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	struct mnt_idmap *idmap = file_mnt_idmap(filp);
 	struct f2fs_inode_info *fi = F2FS_I(inode);
@@ -2333,6 +2381,7 @@ out:
 
 static int f2fs_ioc_commit_atomic_write(struct file *filp)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	struct mnt_idmap *idmap = file_mnt_idmap(filp);
 	int ret;
@@ -2368,6 +2417,7 @@ static int f2fs_ioc_commit_atomic_write(struct file *filp)
 
 static int f2fs_ioc_abort_atomic_write(struct file *filp)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	struct mnt_idmap *idmap = file_mnt_idmap(filp);
 	int ret;
@@ -2396,6 +2446,7 @@ static int f2fs_ioc_abort_atomic_write(struct file *filp)
 int f2fs_do_shutdown(struct f2fs_sb_info *sbi, unsigned int flag,
 						bool readonly, bool need_lock)
 {
+	FUN_START();
 	struct super_block *sb = sbi->sb;
 	int ret = 0;
 
@@ -2467,6 +2518,7 @@ out:
 
 static int f2fs_ioc_shutdown(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	__u32 in;
@@ -2504,6 +2556,7 @@ static int f2fs_ioc_shutdown(struct file *filp, unsigned long arg)
 static int f2fs_keep_noreuse_range(struct inode *inode,
 				loff_t offset, loff_t len)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	u64 max_bytes = F2FS_BLK_TO_BYTES(max_file_blocks(inode));
 	u64 start, end;
@@ -2558,6 +2611,7 @@ static int f2fs_keep_noreuse_range(struct inode *inode,
 
 static int f2fs_ioc_fitrim(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	struct super_block *sb = inode->i_sb;
 	struct fstrim_range range;
@@ -2593,6 +2647,7 @@ static int f2fs_ioc_fitrim(struct file *filp, unsigned long arg)
 
 static bool uuid_is_nonzero(__u8 u[16])
 {
+	FUN_START();
 	int i;
 
 	for (i = 0; i < 16; i++)
@@ -2603,6 +2658,7 @@ static bool uuid_is_nonzero(__u8 u[16])
 
 static int f2fs_ioc_set_encryption_policy(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	int ret;
 
@@ -2616,6 +2672,7 @@ static int f2fs_ioc_set_encryption_policy(struct file *filp, unsigned long arg)
 
 static int f2fs_ioc_get_encryption_policy(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	if (!f2fs_sb_has_encrypt(F2FS_I_SB(file_inode(filp))))
 		return -EOPNOTSUPP;
 	return fscrypt_ioctl_get_policy(filp, (void __user *)arg);
@@ -2623,6 +2680,7 @@ static int f2fs_ioc_get_encryption_policy(struct file *filp, unsigned long arg)
 
 static int f2fs_ioc_get_encryption_pwsalt(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	u8 encrypt_pw_salt[16];
@@ -2664,6 +2722,7 @@ out_err:
 static int f2fs_ioc_get_encryption_policy_ex(struct file *filp,
 					     unsigned long arg)
 {
+	FUN_START();
 	if (!f2fs_sb_has_encrypt(F2FS_I_SB(file_inode(filp))))
 		return -EOPNOTSUPP;
 
@@ -2672,6 +2731,7 @@ static int f2fs_ioc_get_encryption_policy_ex(struct file *filp,
 
 static int f2fs_ioc_add_encryption_key(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	if (!f2fs_sb_has_encrypt(F2FS_I_SB(file_inode(filp))))
 		return -EOPNOTSUPP;
 
@@ -2680,6 +2740,7 @@ static int f2fs_ioc_add_encryption_key(struct file *filp, unsigned long arg)
 
 static int f2fs_ioc_remove_encryption_key(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	if (!f2fs_sb_has_encrypt(F2FS_I_SB(file_inode(filp))))
 		return -EOPNOTSUPP;
 
@@ -2689,6 +2750,7 @@ static int f2fs_ioc_remove_encryption_key(struct file *filp, unsigned long arg)
 static int f2fs_ioc_remove_encryption_key_all_users(struct file *filp,
 						    unsigned long arg)
 {
+	FUN_START();
 	if (!f2fs_sb_has_encrypt(F2FS_I_SB(file_inode(filp))))
 		return -EOPNOTSUPP;
 
@@ -2698,6 +2760,7 @@ static int f2fs_ioc_remove_encryption_key_all_users(struct file *filp,
 static int f2fs_ioc_get_encryption_key_status(struct file *filp,
 					      unsigned long arg)
 {
+	FUN_START();
 	if (!f2fs_sb_has_encrypt(F2FS_I_SB(file_inode(filp))))
 		return -EOPNOTSUPP;
 
@@ -2706,6 +2769,7 @@ static int f2fs_ioc_get_encryption_key_status(struct file *filp,
 
 static int f2fs_ioc_get_encryption_nonce(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	if (!f2fs_sb_has_encrypt(F2FS_I_SB(file_inode(filp))))
 		return -EOPNOTSUPP;
 
@@ -2714,6 +2778,7 @@ static int f2fs_ioc_get_encryption_nonce(struct file *filp, unsigned long arg)
 
 static int f2fs_ioc_gc(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct f2fs_gc_control gc_control = { .victim_segno = NULL_SEGNO,
@@ -2756,6 +2821,7 @@ out:
 
 static int __f2fs_ioc_gc_range(struct file *filp, struct f2fs_gc_range *range)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(file_inode(filp));
 	struct f2fs_gc_control gc_control = {
 			.init_gc_type = range->sync ? FG_GC : BG_GC,
@@ -2808,6 +2874,7 @@ out:
 
 static int f2fs_ioc_gc_range(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct f2fs_gc_range range;
 
 	if (copy_from_user(&range, (struct f2fs_gc_range __user *)arg,
@@ -2847,6 +2914,7 @@ static int f2fs_defragment_range(struct f2fs_sb_info *sbi,
 					struct file *filp,
 					struct f2fs_defragment *range)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	struct f2fs_map_blocks map = { .m_next_extent = NULL,
 					.m_seg_type = NO_CHECK_TYPE,
@@ -3009,6 +3077,7 @@ unlock_out:
 
 static int f2fs_ioc_defragment(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct f2fs_defragment range;
@@ -3057,6 +3126,7 @@ static int f2fs_ioc_defragment(struct file *filp, unsigned long arg)
 static int f2fs_move_file_range(struct file *file_in, loff_t pos_in,
 			struct file *file_out, loff_t pos_out, size_t len)
 {
+	FUN_START();
 	struct inode *src = file_inode(file_in);
 	struct inode *dst = file_inode(file_out);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(src);
@@ -3194,6 +3264,7 @@ out:
 static int __f2fs_ioc_move_range(struct file *filp,
 				struct f2fs_move_range *range)
 {
+	FUN_START();
 	int err;
 
 	if (!(filp->f_mode & FMODE_READ) ||
@@ -3220,6 +3291,7 @@ static int __f2fs_ioc_move_range(struct file *filp,
 
 static int f2fs_ioc_move_range(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct f2fs_move_range range;
 
 	if (copy_from_user(&range, (struct f2fs_move_range __user *)arg,
@@ -3230,6 +3302,7 @@ static int f2fs_ioc_move_range(struct file *filp, unsigned long arg)
 
 static int f2fs_ioc_flush_device(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct sit_info *sm = SIT_I(sbi);
@@ -3301,6 +3374,7 @@ out:
 
 static int f2fs_ioc_get_features(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	u32 sb_feature = le32_to_cpu(F2FS_I_SB(inode)->raw_super->feature);
 
@@ -3313,6 +3387,7 @@ static int f2fs_ioc_get_features(struct file *filp, unsigned long arg)
 #ifdef CONFIG_QUOTA
 int f2fs_transfer_project_quota(struct inode *inode, kprojid_t kprojid)
 {
+	FUN_START();
 	struct dquot *transfer_to[MAXQUOTAS] = {};
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct super_block *sb = sbi->sb;
@@ -3331,6 +3406,7 @@ int f2fs_transfer_project_quota(struct inode *inode, kprojid_t kprojid)
 
 static int f2fs_ioc_setproject(struct inode *inode, __u32 projid)
 {
+	FUN_START();
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct f2fs_inode *ri = NULL;
@@ -3379,11 +3455,13 @@ out_unlock:
 #else
 int f2fs_transfer_project_quota(struct inode *inode, kprojid_t kprojid)
 {
+	FUN_START();
 	return 0;
 }
 
 static int f2fs_ioc_setproject(struct inode *inode, __u32 projid)
 {
+	FUN_START();
 	if (projid != F2FS_DEF_PROJID)
 		return -EOPNOTSUPP;
 	return 0;
@@ -3392,6 +3470,7 @@ static int f2fs_ioc_setproject(struct inode *inode, __u32 projid)
 
 int f2fs_fileattr_get(struct dentry *dentry, struct fileattr *fa)
 {
+	FUN_START();
 	struct inode *inode = d_inode(dentry);
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	u32 fsflags = f2fs_iflags_to_fsflags(fi->i_flags);
@@ -3416,6 +3495,7 @@ int f2fs_fileattr_get(struct dentry *dentry, struct fileattr *fa)
 int f2fs_fileattr_set(struct mnt_idmap *idmap,
 		      struct dentry *dentry, struct fileattr *fa)
 {
+	FUN_START();
 	struct inode *inode = d_inode(dentry);
 	u32 fsflags = fa->flags, mask = F2FS_SETTABLE_FS_FL;
 	u32 iflags;
@@ -3444,6 +3524,7 @@ int f2fs_fileattr_set(struct mnt_idmap *idmap,
 
 int f2fs_pin_file_control(struct inode *inode, bool inc)
 {
+	FUN_START();
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 
@@ -3466,6 +3547,7 @@ int f2fs_pin_file_control(struct inode *inode, bool inc)
 
 static int f2fs_ioc_set_pin_file(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	__u32 pin;
@@ -3540,6 +3622,7 @@ out:
 
 static int f2fs_ioc_get_pin_file(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	__u32 pin = 0;
 
@@ -3550,12 +3633,14 @@ static int f2fs_ioc_get_pin_file(struct file *filp, unsigned long arg)
 
 static int f2fs_ioc_get_dev_alias_file(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	return put_user(IS_DEVICE_ALIASING(file_inode(filp)) ? 1 : 0,
 			(u32 __user *)arg);
 }
 
 static int f2fs_ioc_io_prio(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	__u32 level;
 
@@ -3573,6 +3658,7 @@ static int f2fs_ioc_io_prio(struct file *filp, unsigned long arg)
 
 int f2fs_precache_extents(struct inode *inode)
 {
+	FUN_START();
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	struct f2fs_map_blocks map;
 	pgoff_t m_next_extent;
@@ -3607,11 +3693,13 @@ int f2fs_precache_extents(struct inode *inode)
 
 static int f2fs_ioc_precache_extents(struct file *filp)
 {
+	FUN_START();
 	return f2fs_precache_extents(file_inode(filp));
 }
 
 static int f2fs_ioc_resize_fs(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(file_inode(filp));
 	__u64 block_count;
 
@@ -3630,6 +3718,7 @@ static int f2fs_ioc_resize_fs(struct file *filp, unsigned long arg)
 
 static int f2fs_ioc_enable_verity(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 
 	f2fs_update_time(F2FS_I_SB(inode), REQ_TIME);
@@ -3646,6 +3735,7 @@ static int f2fs_ioc_enable_verity(struct file *filp, unsigned long arg)
 
 static int f2fs_ioc_measure_verity(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	if (!f2fs_sb_has_verity(F2FS_I_SB(file_inode(filp))))
 		return -EOPNOTSUPP;
 
@@ -3654,6 +3744,7 @@ static int f2fs_ioc_measure_verity(struct file *filp, unsigned long arg)
 
 static int f2fs_ioc_read_verity_metadata(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	if (!f2fs_sb_has_verity(F2FS_I_SB(file_inode(filp))))
 		return -EOPNOTSUPP;
 
@@ -3662,6 +3753,7 @@ static int f2fs_ioc_read_verity_metadata(struct file *filp, unsigned long arg)
 
 static int f2fs_ioc_getfslabel(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	char *vbuf;
@@ -3688,6 +3780,7 @@ static int f2fs_ioc_getfslabel(struct file *filp, unsigned long arg)
 
 static int f2fs_ioc_setfslabel(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	char *vbuf;
@@ -3724,6 +3817,7 @@ out:
 
 static int f2fs_get_compress_blocks(struct inode *inode, __u64 *blocks)
 {
+	FUN_START();
 	if (!f2fs_sb_has_compression(F2FS_I_SB(inode)))
 		return -EOPNOTSUPP;
 
@@ -3737,6 +3831,7 @@ static int f2fs_get_compress_blocks(struct inode *inode, __u64 *blocks)
 
 static int f2fs_ioc_get_compress_blocks(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	__u64 blocks;
 	int ret;
@@ -3750,6 +3845,7 @@ static int f2fs_ioc_get_compress_blocks(struct file *filp, unsigned long arg)
 
 static int release_compress_blocks(struct dnode_of_data *dn, pgoff_t count)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dn->inode);
 	unsigned int released_blocks = 0;
 	int cluster_size = F2FS_I(dn->inode)->i_cluster_size;
@@ -3803,6 +3899,7 @@ next:
 
 static int f2fs_release_compress_blocks(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
@@ -3920,6 +4017,7 @@ out:
 static int reserve_compress_blocks(struct dnode_of_data *dn, pgoff_t count,
 		unsigned int *reserved_blocks)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dn->inode);
 	int cluster_size = F2FS_I(dn->inode)->i_cluster_size;
 	block_t blkaddr;
@@ -3999,6 +4097,7 @@ next:
 
 static int f2fs_reserve_compress_blocks(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
@@ -4102,6 +4201,7 @@ unlock_inode:
 static int f2fs_secure_erase(struct block_device *bdev, struct inode *inode,
 		pgoff_t off, block_t block, block_t len, u32 flags)
 {
+	FUN_START();
 	sector_t sector = SECTOR_FROM_BLOCK(block);
 	sector_t nr_sects = SECTOR_FROM_BLOCK(len);
 	int ret = 0;
@@ -4128,6 +4228,7 @@ static int f2fs_secure_erase(struct block_device *bdev, struct inode *inode,
 
 static int f2fs_sec_trim_file(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct address_space *mapping = inode->i_mapping;
@@ -4291,6 +4392,7 @@ err:
 
 static int f2fs_ioc_get_compress_option(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	struct f2fs_comp_option option;
 
@@ -4318,6 +4420,7 @@ static int f2fs_ioc_get_compress_option(struct file *filp, unsigned long arg)
 
 static int f2fs_ioc_set_compress_option(struct file *filp, unsigned long arg)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
@@ -4387,6 +4490,7 @@ out:
 
 static int redirty_blocks(struct inode *inode, pgoff_t page_idx, int len)
 {
+	FUN_START();
 	DEFINE_READAHEAD(ractl, NULL, NULL, inode->i_mapping, page_idx);
 	struct address_space *mapping = inode->i_mapping;
 	struct folio *folio;
@@ -4425,6 +4529,7 @@ static int redirty_blocks(struct inode *inode, pgoff_t page_idx, int len)
 
 static int f2fs_ioc_decompress_file(struct file *filp)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct f2fs_inode_info *fi = F2FS_I(inode);
@@ -4506,6 +4611,7 @@ out:
 
 static int f2fs_ioc_compress_file(struct file *filp)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct f2fs_inode_info *fi = F2FS_I(inode);
@@ -4588,6 +4694,7 @@ out:
 
 static long __f2fs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
+	FUN_START();
 	switch (cmd) {
 	case FS_IOC_GETVERSION:
 		return f2fs_ioc_getversion(filp, arg);
@@ -4683,6 +4790,7 @@ static long __f2fs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 long f2fs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
+	FUN_START();
 	if (unlikely(f2fs_cp_error(F2FS_I_SB(file_inode(filp)))))
 		return -EIO;
 	if (!f2fs_is_checkpoint_ready(F2FS_I_SB(file_inode(filp))))
@@ -4698,6 +4806,7 @@ long f2fs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 static bool f2fs_should_use_dio(struct inode *inode, struct kiocb *iocb,
 				struct iov_iter *iter)
 {
+	FUN_START();
 	unsigned int align;
 
 	if (!(iocb->ki_flags & IOCB_DIRECT))
@@ -4728,6 +4837,7 @@ static bool f2fs_should_use_dio(struct inode *inode, struct kiocb *iocb,
 static int f2fs_dio_read_end_io(struct kiocb *iocb, ssize_t size, int error,
 				unsigned int flags)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(file_inode(iocb->ki_filp));
 
 	dec_page_count(sbi, F2FS_DIO_READ);
@@ -4743,6 +4853,7 @@ static const struct iomap_dio_ops f2fs_iomap_dio_read_ops = {
 
 static ssize_t f2fs_dio_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
+	FUN_START();
 	struct file *file = iocb->ki_filp;
 	struct inode *inode = file_inode(file);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
@@ -4800,6 +4911,7 @@ out:
 static void f2fs_trace_rw_file_path(struct file *file, loff_t pos, size_t count,
 				    int rw)
 {
+	FUN_START();
 	struct inode *inode = file_inode(file);
 	char *buf, *path;
 
@@ -4821,10 +4933,11 @@ free_buf:
 
 static ssize_t f2fs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
+	FUN_START();
 	struct inode *inode = file_inode(iocb->ki_filp);
 	const loff_t pos = iocb->ki_pos;
 	ssize_t ret;
-
+	print_filename_from_inode(inode);
 	if (!f2fs_is_compress_backend_ready(inode))
 		return -EOPNOTSUPP;
 
@@ -4847,6 +4960,7 @@ static ssize_t f2fs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	}
 	if (trace_f2fs_dataread_end_enabled())
 		trace_f2fs_dataread_end(inode, pos, ret);
+	FUN_END();
 	return ret;
 }
 
@@ -4854,6 +4968,7 @@ static ssize_t f2fs_file_splice_read(struct file *in, loff_t *ppos,
 				     struct pipe_inode_info *pipe,
 				     size_t len, unsigned int flags)
 {
+	FUN_START();
 	struct inode *inode = file_inode(in);
 	const loff_t pos = *ppos;
 	ssize_t ret;
@@ -4871,11 +4986,13 @@ static ssize_t f2fs_file_splice_read(struct file *in, loff_t *ppos,
 
 	if (trace_f2fs_dataread_end_enabled())
 		trace_f2fs_dataread_end(inode, pos, ret);
+	FUN_END();
 	return ret;
 }
 
 static ssize_t f2fs_write_checks(struct kiocb *iocb, struct iov_iter *from)
 {
+	FUN_START();
 	struct file *file = iocb->ki_filp;
 	struct inode *inode = file_inode(file);
 	ssize_t count;
@@ -4911,6 +5028,7 @@ static ssize_t f2fs_write_checks(struct kiocb *iocb, struct iov_iter *from)
 static int f2fs_preallocate_blocks(struct kiocb *iocb, struct iov_iter *iter,
 				   bool dio)
 {
+	FUN_START();
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	const loff_t pos = iocb->ki_pos;
@@ -4978,6 +5096,7 @@ static int f2fs_preallocate_blocks(struct kiocb *iocb, struct iov_iter *iter,
 static ssize_t f2fs_buffered_write_iter(struct kiocb *iocb,
 					struct iov_iter *from)
 {
+	FUN_START();
 	struct file *file = iocb->ki_filp;
 	struct inode *inode = file_inode(file);
 	ssize_t ret;
@@ -4997,6 +5116,7 @@ static ssize_t f2fs_buffered_write_iter(struct kiocb *iocb,
 static int f2fs_dio_write_end_io(struct kiocb *iocb, ssize_t size, int error,
 				 unsigned int flags)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(file_inode(iocb->ki_filp));
 
 	dec_page_count(sbi, F2FS_DIO_WRITE);
@@ -5010,6 +5130,7 @@ static int f2fs_dio_write_end_io(struct kiocb *iocb, ssize_t size, int error,
 static void f2fs_dio_write_submit_io(const struct iomap_iter *iter,
 					struct bio *bio, loff_t file_offset)
 {
+	FUN_START();
 	struct inode *inode = iter->inode;
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	enum log_type type = f2fs_rw_hint_to_seg_type(sbi, inode->i_write_hint);
@@ -5027,6 +5148,7 @@ static const struct iomap_dio_ops f2fs_iomap_dio_write_ops = {
 static void f2fs_flush_buffered_write(struct address_space *mapping,
 				      loff_t start_pos, loff_t end_pos)
 {
+	FUN_START();
 	int ret;
 
 	ret = filemap_write_and_wait_range(mapping, start_pos, end_pos);
@@ -5040,6 +5162,7 @@ static void f2fs_flush_buffered_write(struct address_space *mapping,
 static ssize_t f2fs_dio_write_iter(struct kiocb *iocb, struct iov_iter *from,
 				   bool *may_need_sync)
 {
+	FUN_START();
 	struct file *file = iocb->ki_filp;
 	struct inode *inode = file_inode(file);
 	struct f2fs_inode_info *fi = F2FS_I(inode);
@@ -5151,6 +5274,7 @@ out:
 
 static ssize_t f2fs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
+	FUN_START();
 	struct inode *inode = file_inode(iocb->ki_filp);
 	const loff_t orig_pos = iocb->ki_pos;
 	const size_t orig_count = iov_iter_count(from);
@@ -5254,6 +5378,7 @@ out:
 static int f2fs_file_fadvise(struct file *filp, loff_t offset, loff_t len,
 		int advice)
 {
+	FUN_START();
 	struct address_space *mapping;
 	struct backing_dev_info *bdi;
 	struct inode *inode = file_inode(filp);
@@ -5303,6 +5428,7 @@ struct compat_f2fs_gc_range {
 
 static int f2fs_compat_ioc_gc_range(struct file *file, unsigned long arg)
 {
+	FUN_START();
 	struct compat_f2fs_gc_range __user *urange;
 	struct f2fs_gc_range range;
 	int err;
@@ -5328,6 +5454,7 @@ struct compat_f2fs_move_range {
 
 static int f2fs_compat_ioc_move_range(struct file *file, unsigned long arg)
 {
+	FUN_START();
 	struct compat_f2fs_move_range __user *urange;
 	struct f2fs_move_range range;
 	int err;
@@ -5345,6 +5472,7 @@ static int f2fs_compat_ioc_move_range(struct file *file, unsigned long arg)
 
 long f2fs_compat_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
+	FUN_START();
 	if (unlikely(f2fs_cp_error(F2FS_I_SB(file_inode(file)))))
 		return -EIO;
 	if (!f2fs_is_checkpoint_ready(F2FS_I_SB(file_inode(file))))
