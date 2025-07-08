@@ -12,6 +12,7 @@
 #include "f2fs.h"
 #include "node.h"
 #include "segment.h"
+#include "f2fs_printk.h"
 
 /*
  * Roll forward recovery scenarios.
@@ -48,6 +49,7 @@ static struct kmem_cache *fsync_entry_slab;
 
 bool f2fs_space_for_roll_forward(struct f2fs_sb_info *sbi)
 {
+	FUN_START();
 	s64 nalloc = percpu_counter_sum_positive(&sbi->alloc_valid_block_count);
 
 	if (sbi->last_valid_block_count + nalloc > sbi->user_block_count)
@@ -62,6 +64,7 @@ bool f2fs_space_for_roll_forward(struct f2fs_sb_info *sbi)
 static struct fsync_inode_entry *get_fsync_inode(struct list_head *head,
 								nid_t ino)
 {
+	FUN_START();
 	struct fsync_inode_entry *entry;
 
 	list_for_each_entry(entry, head, list)
@@ -74,6 +77,7 @@ static struct fsync_inode_entry *get_fsync_inode(struct list_head *head,
 static struct fsync_inode_entry *add_fsync_inode(struct f2fs_sb_info *sbi,
 			struct list_head *head, nid_t ino, bool quota_inode)
 {
+	FUN_START();
 	struct inode *inode;
 	struct fsync_inode_entry *entry;
 	int err;
@@ -105,6 +109,7 @@ err_out:
 
 static void del_fsync_inode(struct fsync_inode_entry *entry, int drop)
 {
+	FUN_START();
 	if (drop) {
 		/* inode should not be recovered, drop it */
 		f2fs_inode_synced(entry->inode);
@@ -119,6 +124,7 @@ static int init_recovered_filename(const struct inode *dir,
 				   struct f2fs_filename *fname,
 				   struct qstr *usr_fname)
 {
+	FUN_START();
 	int err;
 
 	memset(fname, 0, sizeof(*fname));
@@ -160,6 +166,7 @@ static int init_recovered_filename(const struct inode *dir,
 static int recover_dentry(struct inode *inode, struct page *ipage,
 						struct list_head *dir_list)
 {
+	FUN_START();
 	struct f2fs_inode *raw_inode = F2FS_INODE(ipage);
 	nid_t pino = le32_to_cpu(raw_inode->i_pino);
 	struct f2fs_dir_entry *de;
@@ -240,6 +247,7 @@ out:
 
 static int recover_quota_data(struct inode *inode, struct page *page)
 {
+	FUN_START();
 	struct f2fs_inode *raw = F2FS_INODE(page);
 	struct iattr attr;
 	uid_t i_uid = le32_to_cpu(raw->i_uid);
@@ -267,6 +275,7 @@ static int recover_quota_data(struct inode *inode, struct page *page)
 
 static void recover_inline_flags(struct inode *inode, struct f2fs_inode *ri)
 {
+	FUN_START();
 	if (ri->i_inline & F2FS_PIN_FILE)
 		set_inode_flag(inode, FI_PIN_FILE);
 	else
@@ -279,6 +288,7 @@ static void recover_inline_flags(struct inode *inode, struct f2fs_inode *ri)
 
 static int recover_inode(struct inode *inode, struct page *page)
 {
+	FUN_START();
 	struct f2fs_inode *raw = F2FS_INODE(page);
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	char *name;
@@ -344,6 +354,7 @@ static unsigned int adjust_por_ra_blocks(struct f2fs_sb_info *sbi,
 				unsigned int ra_blocks, unsigned int blkaddr,
 				unsigned int next_blkaddr)
 {
+	FUN_START();
 	if (blkaddr + 1 == next_blkaddr)
 		ra_blocks = min_t(unsigned int, RECOVERY_MAX_RA_BLOCKS,
 							ra_blocks * 2);
@@ -357,6 +368,7 @@ static unsigned int adjust_por_ra_blocks(struct f2fs_sb_info *sbi,
 static int sanity_check_node_chain(struct f2fs_sb_info *sbi, block_t blkaddr,
 		block_t *blkaddr_fast, bool *is_detecting)
 {
+	FUN_START();
 	unsigned int ra_blocks = RECOVERY_MAX_RA_BLOCKS;
 	int i;
 
@@ -401,6 +413,7 @@ static int sanity_check_node_chain(struct f2fs_sb_info *sbi, block_t blkaddr,
 static int find_fsync_dnodes(struct f2fs_sb_info *sbi, struct list_head *head,
 				bool check_only)
 {
+	FUN_START();
 	struct curseg_info *curseg;
 	block_t blkaddr, blkaddr_fast;
 	bool is_detecting = true;
@@ -480,6 +493,7 @@ next:
 
 static void destroy_fsync_dnodes(struct list_head *head, int drop)
 {
+	FUN_START();
 	struct fsync_inode_entry *entry, *tmp;
 
 	list_for_each_entry_safe(entry, tmp, head, list)
@@ -489,6 +503,7 @@ static void destroy_fsync_dnodes(struct list_head *head, int drop)
 static int check_index_in_prev_nodes(struct f2fs_sb_info *sbi,
 			block_t blkaddr, struct dnode_of_data *dn)
 {
+	FUN_START();
 	struct seg_entry *sentry;
 	unsigned int segno = GET_SEGNO(sbi, blkaddr);
 	unsigned short blkoff = GET_BLKOFF_FROM_SEG0(sbi, blkaddr);
@@ -608,6 +623,7 @@ truncate_out:
 
 static int f2fs_reserve_new_block_retry(struct dnode_of_data *dn)
 {
+	FUN_START();
 	int i, err = 0;
 
 	for (i = DEFAULT_FAILURE_RETRY_COUNT; i > 0; i--) {
@@ -622,6 +638,7 @@ static int f2fs_reserve_new_block_retry(struct dnode_of_data *dn)
 static int do_recover_data(struct f2fs_sb_info *sbi, struct inode *inode,
 					struct folio *folio)
 {
+	FUN_START();
 	struct dnode_of_data dn;
 	struct node_info ni;
 	unsigned int start, end;
@@ -774,6 +791,7 @@ out:
 static int recover_data(struct f2fs_sb_info *sbi, struct list_head *inode_list,
 		struct list_head *tmp_inode_list, struct list_head *dir_list)
 {
+	FUN_START();
 	struct curseg_info *curseg;
 	int err = 0;
 	block_t blkaddr;
@@ -848,6 +866,7 @@ next:
 
 int f2fs_recover_fsync_data(struct f2fs_sb_info *sbi, bool check_only)
 {
+	FUN_START();
 	struct list_head inode_list, tmp_inode_list;
 	struct list_head dir_list;
 	int err;
@@ -931,6 +950,7 @@ skip:
 
 int __init f2fs_create_recovery_cache(void)
 {
+	FUN_START();
 	fsync_entry_slab = f2fs_kmem_cache_create("f2fs_fsync_inode_entry",
 					sizeof(struct fsync_inode_entry));
 	return fsync_entry_slab ? 0 : -ENOMEM;
@@ -938,5 +958,6 @@ int __init f2fs_create_recovery_cache(void)
 
 void f2fs_destroy_recovery_cache(void)
 {
+	FUN_START();
 	kmem_cache_destroy(fsync_entry_slab);
 }
