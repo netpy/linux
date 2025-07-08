@@ -28,11 +28,13 @@
 
 #include "f2fs.h"
 #include "xattr.h"
+#include "f2fs_printk.h"
 
 #define F2FS_VERIFY_VER	(1)
 
 static inline loff_t f2fs_verity_metadata_pos(const struct inode *inode)
 {
+	FUN_START();
 	return round_up(inode->i_size, 65536);
 }
 
@@ -43,6 +45,7 @@ static inline loff_t f2fs_verity_metadata_pos(const struct inode *inode)
 static int pagecache_read(struct inode *inode, void *buf, size_t count,
 			  loff_t pos)
 {
+	FUN_START();
 	while (count) {
 		size_t n = min_t(size_t, count,
 				 PAGE_SIZE - offset_in_page(pos));
@@ -71,6 +74,7 @@ static int pagecache_read(struct inode *inode, void *buf, size_t count,
 static int pagecache_write(struct inode *inode, const void *buf, size_t count,
 			   loff_t pos)
 {
+	FUN_START();
 	struct address_space *mapping = inode->i_mapping;
 	const struct address_space_operations *aops = mapping->a_ops;
 
@@ -117,6 +121,7 @@ struct fsverity_descriptor_location {
 
 static int f2fs_begin_enable_verity(struct file *filp)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	int err;
 
@@ -146,6 +151,7 @@ static int f2fs_begin_enable_verity(struct file *filp)
 static int f2fs_end_enable_verity(struct file *filp, const void *desc,
 				  size_t desc_size, u64 merkle_tree_size)
 {
+	FUN_START();
 	struct inode *inode = file_inode(filp);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	u64 desc_pos = f2fs_verity_metadata_pos(inode) + merkle_tree_size;
@@ -219,6 +225,7 @@ cleanup:
 static int f2fs_get_verity_descriptor(struct inode *inode, void *buf,
 				      size_t buf_size)
 {
+	FUN_START();
 	struct fsverity_descriptor_location dloc;
 	int res;
 	u32 size;
@@ -259,6 +266,7 @@ static struct page *f2fs_read_merkle_tree_page(struct inode *inode,
 					       pgoff_t index,
 					       unsigned long num_ra_pages)
 {
+	FUN_START();
 	struct folio *folio;
 
 	index += f2fs_verity_metadata_pos(inode) >> PAGE_SHIFT;
@@ -281,6 +289,7 @@ static struct page *f2fs_read_merkle_tree_page(struct inode *inode,
 static int f2fs_write_merkle_tree_block(struct inode *inode, const void *buf,
 					u64 pos, unsigned int size)
 {
+	FUN_START();
 	pos += f2fs_verity_metadata_pos(inode);
 
 	return pagecache_write(inode, buf, size, pos);
