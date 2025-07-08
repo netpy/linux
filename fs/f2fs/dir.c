@@ -15,6 +15,7 @@
 #include "acl.h"
 #include "xattr.h"
 #include <trace/events/f2fs.h>
+#include "f2fs_printk.h"
 
 #if IS_ENABLED(CONFIG_UNICODE)
 extern struct kmem_cache *f2fs_cf_name_slab;
@@ -22,12 +23,14 @@ extern struct kmem_cache *f2fs_cf_name_slab;
 
 static unsigned long dir_blocks(struct inode *inode)
 {
+	FUN_START();
 	return ((unsigned long long) (i_size_read(inode) + PAGE_SIZE - 1))
 							>> PAGE_SHIFT;
 }
 
 static unsigned int dir_buckets(unsigned int level, int dir_level)
 {
+	FUN_START();
 	if (level + dir_level < MAX_DIR_HASH_DEPTH / 2)
 		return BIT(level + dir_level);
 	else
@@ -36,6 +39,7 @@ static unsigned int dir_buckets(unsigned int level, int dir_level)
 
 static unsigned int bucket_blocks(unsigned int level)
 {
+	FUN_START();
 	if (level < MAX_DIR_HASH_DEPTH / 2)
 		return 2;
 	else
@@ -47,6 +51,7 @@ static unsigned int bucket_blocks(unsigned int level)
 int f2fs_init_casefolded_name(const struct inode *dir,
 			      struct f2fs_filename *fname)
 {
+	FUN_START();
 	struct super_block *sb = dir->i_sb;
 	unsigned char *buf;
 	int len;
@@ -76,6 +81,7 @@ int f2fs_init_casefolded_name(const struct inode *dir,
 
 void f2fs_free_casefolded_name(struct f2fs_filename *fname)
 {
+	FUN_START();
 	unsigned char *buf = (unsigned char *)fname->cf_name.name;
 
 	if (buf) {
@@ -89,6 +95,7 @@ static int __f2fs_setup_filename(const struct inode *dir,
 				 const struct fscrypt_name *crypt_name,
 				 struct f2fs_filename *fname)
 {
+	FUN_START();
 	int err;
 
 	memset(fname, 0, sizeof(*fname));
@@ -121,6 +128,7 @@ static int __f2fs_setup_filename(const struct inode *dir,
 int f2fs_setup_filename(struct inode *dir, const struct qstr *iname,
 			int lookup, struct f2fs_filename *fname)
 {
+	FUN_START();
 	struct fscrypt_name crypt_name;
 	int err;
 
@@ -140,6 +148,7 @@ int f2fs_setup_filename(struct inode *dir, const struct qstr *iname,
 int f2fs_prepare_lookup(struct inode *dir, struct dentry *dentry,
 			struct f2fs_filename *fname)
 {
+	FUN_START();
 	struct fscrypt_name crypt_name;
 	int err;
 
@@ -152,6 +161,7 @@ int f2fs_prepare_lookup(struct inode *dir, struct dentry *dentry,
 
 void f2fs_free_filename(struct f2fs_filename *fname)
 {
+	FUN_START();
 #ifdef CONFIG_FS_ENCRYPTION
 	kfree(fname->crypto_buf.name);
 	fname->crypto_buf.name = NULL;
@@ -162,6 +172,7 @@ void f2fs_free_filename(struct f2fs_filename *fname)
 static unsigned long dir_block_index(unsigned int level,
 				int dir_level, unsigned int idx)
 {
+	FUN_START();
 	unsigned long i;
 	unsigned long bidx = 0;
 
@@ -178,6 +189,7 @@ static struct f2fs_dir_entry *find_in_block(struct inode *dir,
 				int *max_slots,
 				bool use_hash)
 {
+	FUN_START();
 	struct f2fs_dentry_block *dentry_blk;
 	struct f2fs_dentry_ptr d;
 
@@ -191,6 +203,7 @@ static inline int f2fs_match_name(const struct inode *dir,
 				   const struct f2fs_filename *fname,
 				   const u8 *de_name, u32 de_name_len)
 {
+	FUN_START();
 	struct fscrypt_name f;
 
 #if IS_ENABLED(CONFIG_UNICODE)
@@ -212,6 +225,7 @@ struct f2fs_dir_entry *f2fs_find_target_dentry(const struct f2fs_dentry_ptr *d,
 			const struct f2fs_filename *fname, int *max_slots,
 			bool use_hash)
 {
+	FUN_START();
 	struct f2fs_dir_entry *de;
 	unsigned long bit_pos = 0;
 	int max_len = 0;
@@ -263,6 +277,7 @@ static struct f2fs_dir_entry *find_in_level(struct inode *dir,
 					struct folio **res_folio,
 					bool use_hash)
 {
+	FUN_START();
 	int s = GET_DENTRY_SLOTS(fname->disk_name.len);
 	unsigned int nbucket, nblock;
 	unsigned int bidx, end_block, bucket_no;
@@ -331,6 +346,7 @@ struct f2fs_dir_entry *__f2fs_find_entry(struct inode *dir,
 					 const struct f2fs_filename *fname,
 					 struct folio **res_folio)
 {
+	FUN_START();
 	unsigned long npages = dir_blocks(dir);
 	struct f2fs_dir_entry *de = NULL;
 	unsigned int max_depth;
@@ -387,6 +403,7 @@ out:
 struct f2fs_dir_entry *f2fs_find_entry(struct inode *dir,
 			const struct qstr *child, struct folio **res_folio)
 {
+	FUN_START();
 	struct f2fs_dir_entry *de = NULL;
 	struct f2fs_filename fname;
 	int err;
@@ -408,12 +425,14 @@ struct f2fs_dir_entry *f2fs_find_entry(struct inode *dir,
 
 struct f2fs_dir_entry *f2fs_parent_dir(struct inode *dir, struct folio **f)
 {
+	FUN_START();
 	return f2fs_find_entry(dir, &dotdot_name, f);
 }
 
 ino_t f2fs_inode_by_name(struct inode *dir, const struct qstr *qstr,
 							struct folio **folio)
 {
+	FUN_START();
 	ino_t res = 0;
 	struct f2fs_dir_entry *de;
 
@@ -429,6 +448,7 @@ ino_t f2fs_inode_by_name(struct inode *dir, const struct qstr *qstr,
 void f2fs_set_link(struct inode *dir, struct f2fs_dir_entry *de,
 		struct folio *folio, struct inode *inode)
 {
+	FUN_START();
 	enum page_type type = f2fs_has_inline_dentry(dir) ? NODE : DATA;
 
 	folio_lock(folio);
@@ -446,6 +466,7 @@ static void init_dent_inode(struct inode *dir, struct inode *inode,
 			    const struct f2fs_filename *fname,
 			    struct folio *ifolio)
 {
+	FUN_START();
 	struct f2fs_inode *ri;
 
 	if (!fname) /* tmpfile case? */
@@ -481,6 +502,7 @@ static void init_dent_inode(struct inode *dir, struct inode *inode,
 void f2fs_do_make_empty_dir(struct inode *inode, struct inode *parent,
 					struct f2fs_dentry_ptr *d)
 {
+	FUN_START();
 	struct fscrypt_str dot = FSTR_INIT(".", 1);
 	struct fscrypt_str dotdot = FSTR_INIT("..", 2);
 
@@ -494,6 +516,7 @@ void f2fs_do_make_empty_dir(struct inode *inode, struct inode *parent,
 static int make_empty_dir(struct inode *inode,
 		struct inode *parent, struct folio *folio)
 {
+	FUN_START();
 	struct folio *dentry_folio;
 	struct f2fs_dentry_block *dentry_blk;
 	struct f2fs_dentry_ptr d;
@@ -518,6 +541,7 @@ static int make_empty_dir(struct inode *inode,
 struct folio *f2fs_init_inode_metadata(struct inode *inode, struct inode *dir,
 		const struct f2fs_filename *fname, struct folio *dfolio)
 {
+	FUN_START();
 	struct folio *folio;
 	int err;
 
@@ -587,6 +611,7 @@ put_error:
 void f2fs_update_parent_metadata(struct inode *dir, struct inode *inode,
 						unsigned int current_depth)
 {
+	FUN_START();
 	if (inode && is_inode_flag_set(inode, FI_NEW_INODE)) {
 		if (S_ISDIR(inode->i_mode))
 			f2fs_i_links_write(dir, true);
@@ -604,6 +629,7 @@ void f2fs_update_parent_metadata(struct inode *dir, struct inode *inode,
 
 int f2fs_room_for_filename(const void *bitmap, int slots, int max_slots)
 {
+	FUN_START();
 	int bit_start = 0;
 	int zero_start, zero_end;
 next:
@@ -625,6 +651,7 @@ next:
 bool f2fs_has_enough_room(struct inode *dir, struct folio *ifolio,
 			  const struct f2fs_filename *fname)
 {
+	FUN_START();
 	struct f2fs_dentry_ptr d;
 	unsigned int bit_pos;
 	int slots = GET_DENTRY_SLOTS(fname->disk_name.len);
@@ -640,6 +667,7 @@ void f2fs_update_dentry(nid_t ino, umode_t mode, struct f2fs_dentry_ptr *d,
 			const struct fscrypt_str *name, f2fs_hash_t name_hash,
 			unsigned int bit_pos)
 {
+	FUN_START();
 	struct f2fs_dir_entry *de;
 	int slots = GET_DENTRY_SLOTS(name->len);
 	int i;
@@ -661,6 +689,7 @@ void f2fs_update_dentry(nid_t ino, umode_t mode, struct f2fs_dentry_ptr *d,
 int f2fs_add_regular_entry(struct inode *dir, const struct f2fs_filename *fname,
 			   struct inode *inode, nid_t ino, umode_t mode)
 {
+	FUN_START();
 	unsigned int bit_pos;
 	unsigned int level;
 	unsigned int current_depth;
@@ -756,6 +785,7 @@ fail:
 int f2fs_add_dentry(struct inode *dir, const struct f2fs_filename *fname,
 		    struct inode *inode, nid_t ino, umode_t mode)
 {
+	FUN_START();
 	int err = -EAGAIN;
 
 	if (f2fs_has_inline_dentry(dir)) {
@@ -781,6 +811,7 @@ int f2fs_add_dentry(struct inode *dir, const struct f2fs_filename *fname,
 int f2fs_do_add_link(struct inode *dir, const struct qstr *name,
 				struct inode *inode, nid_t ino, umode_t mode)
 {
+	FUN_START();
 	struct f2fs_filename fname;
 	struct folio *folio = NULL;
 	struct f2fs_dir_entry *de = NULL;
@@ -816,6 +847,7 @@ int f2fs_do_add_link(struct inode *dir, const struct qstr *name,
 int f2fs_do_tmpfile(struct inode *inode, struct inode *dir,
 					struct f2fs_filename *fname)
 {
+	FUN_START();
 	struct folio *folio;
 	int err = 0;
 
@@ -836,6 +868,7 @@ fail:
 
 void f2fs_drop_nlink(struct inode *dir, struct inode *inode)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dir);
 
 	f2fs_down_write(&F2FS_I(inode)->i_sem);
@@ -864,6 +897,7 @@ void f2fs_drop_nlink(struct inode *dir, struct inode *inode)
 void f2fs_delete_entry(struct f2fs_dir_entry *dentry, struct folio *folio,
 					struct inode *dir, struct inode *inode)
 {
+	FUN_START();
 	struct f2fs_dentry_block *dentry_blk;
 	unsigned int bit_pos;
 	int slots = GET_DENTRY_SLOTS(le16_to_cpu(dentry->name_len));
@@ -913,6 +947,7 @@ void f2fs_delete_entry(struct f2fs_dir_entry *dentry, struct folio *folio,
 
 bool f2fs_empty_dir(struct inode *dir)
 {
+	FUN_START();
 	unsigned long bidx = 0;
 	unsigned int bit_pos;
 	struct f2fs_dentry_block *dentry_blk;
@@ -957,6 +992,7 @@ bool f2fs_empty_dir(struct inode *dir)
 int f2fs_fill_dentries(struct dir_context *ctx, struct f2fs_dentry_ptr *d,
 			unsigned int start_pos, struct fscrypt_str *fstr)
 {
+	FUN_START();
 	unsigned char d_type = DT_UNKNOWN;
 	unsigned int bit_pos;
 	struct f2fs_dir_entry *de = NULL;
@@ -1040,6 +1076,7 @@ out:
 
 static int f2fs_readdir(struct file *file, struct dir_context *ctx)
 {
+	FUN_START();
 	struct inode *inode = file_inode(file);
 	unsigned long npages = dir_blocks(inode);
 	struct f2fs_dentry_block *dentry_blk = NULL;
