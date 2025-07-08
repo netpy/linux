@@ -13,9 +13,11 @@
 #include "f2fs.h"
 #include "node.h"
 #include <trace/events/f2fs.h>
+#include "f2fs_printk.h"
 
 static bool support_inline_data(struct inode *inode)
 {
+	FUN_START();
 	if (f2fs_used_in_atomic_write(inode))
 		return false;
 	if (!S_ISREG(inode->i_mode) && !S_ISLNK(inode->i_mode))
@@ -27,6 +29,7 @@ static bool support_inline_data(struct inode *inode)
 
 bool f2fs_may_inline_data(struct inode *inode)
 {
+	FUN_START();
 	if (!support_inline_data(inode))
 		return false;
 
@@ -35,6 +38,7 @@ bool f2fs_may_inline_data(struct inode *inode)
 
 static bool inode_has_blocks(struct inode *inode, struct page *ipage)
 {
+	FUN_START();
 	struct f2fs_inode *ri = F2FS_INODE(ipage);
 	int i;
 
@@ -50,6 +54,7 @@ static bool inode_has_blocks(struct inode *inode, struct page *ipage)
 
 bool f2fs_sanity_check_inline_data(struct inode *inode, struct page *ipage)
 {
+	FUN_START();
 	if (!f2fs_has_inline_data(inode))
 		return false;
 
@@ -70,6 +75,7 @@ bool f2fs_sanity_check_inline_data(struct inode *inode, struct page *ipage)
 
 bool f2fs_may_inline_dentry(struct inode *inode)
 {
+	FUN_START();
 	if (!test_opt(F2FS_I_SB(inode), INLINE_DENTRY))
 		return false;
 
@@ -81,6 +87,7 @@ bool f2fs_may_inline_dentry(struct inode *inode)
 
 void f2fs_do_read_inline_data(struct folio *folio, struct folio *ifolio)
 {
+	FUN_START();
 	struct inode *inode = folio->mapping->host;
 
 	if (folio_test_uptodate(folio))
@@ -93,6 +100,7 @@ void f2fs_do_read_inline_data(struct folio *folio, struct folio *ifolio)
 	/* Copy the whole inline data block */
 	memcpy_to_folio(folio, 0, inline_data_addr(inode, ifolio),
 		       MAX_INLINE_DATA(inode));
+	FUN_END();
 	if (!folio_test_uptodate(folio))
 		folio_mark_uptodate(folio);
 }
@@ -100,6 +108,7 @@ void f2fs_do_read_inline_data(struct folio *folio, struct folio *ifolio)
 void f2fs_truncate_inline_inode(struct inode *inode, struct folio *ifolio,
 		u64 from)
 {
+	FUN_START();
 	void *addr;
 
 	if (from >= MAX_INLINE_DATA(inode))
@@ -117,8 +126,9 @@ void f2fs_truncate_inline_inode(struct inode *inode, struct folio *ifolio,
 
 int f2fs_read_inline_data(struct inode *inode, struct folio *folio)
 {
+	FUN_START();
 	struct folio *ifolio;
-
+	print_filename_from_inode(inode);
 	ifolio = f2fs_get_inode_folio(F2FS_I_SB(inode), inode->i_ino);
 	if (IS_ERR(ifolio)) {
 		folio_unlock(folio);
@@ -139,11 +149,13 @@ int f2fs_read_inline_data(struct inode *inode, struct folio *folio)
 		folio_mark_uptodate(folio);
 	f2fs_folio_put(ifolio, true);
 	folio_unlock(folio);
+	FUN_END();
 	return 0;
 }
 
 int f2fs_convert_inline_folio(struct dnode_of_data *dn, struct folio *folio)
 {
+	FUN_START();
 	struct f2fs_io_info fio = {
 		.sbi = F2FS_I_SB(dn->inode),
 		.ino = dn->inode->i_ino,
@@ -216,6 +228,7 @@ clear_out:
 
 int f2fs_convert_inline_inode(struct inode *inode)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct dnode_of_data dn;
 	struct folio *ifolio, *folio;
@@ -262,6 +275,7 @@ out:
 
 int f2fs_write_inline_data(struct inode *inode, struct folio *folio)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct folio *ifolio;
 
@@ -293,6 +307,7 @@ int f2fs_write_inline_data(struct inode *inode, struct folio *folio)
 
 int f2fs_recover_inline_data(struct inode *inode, struct folio *nfolio)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct f2fs_inode *ri = NULL;
 	void *src_addr, *dst_addr;
@@ -355,6 +370,7 @@ struct f2fs_dir_entry *f2fs_find_in_inline_dir(struct inode *dir,
 					struct folio **res_folio,
 					bool use_hash)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_SB(dir->i_sb);
 	struct f2fs_dir_entry *de;
 	struct f2fs_dentry_ptr d;
@@ -387,6 +403,7 @@ struct f2fs_dir_entry *f2fs_find_in_inline_dir(struct inode *dir,
 int f2fs_make_empty_inline_dir(struct inode *inode, struct inode *parent,
 							struct folio *ifolio)
 {
+	FUN_START();
 	struct f2fs_dentry_ptr d;
 	void *inline_dentry;
 
@@ -410,6 +427,7 @@ int f2fs_make_empty_inline_dir(struct inode *inode, struct inode *parent,
 static int f2fs_move_inline_dirents(struct inode *dir, struct folio *ifolio,
 							void *inline_dentry)
 {
+	FUN_START();
 	struct folio *folio;
 	struct dnode_of_data dn;
 	struct f2fs_dentry_block *dentry_blk;
@@ -483,6 +501,7 @@ out:
 
 static int f2fs_add_inline_entries(struct inode *dir, void *inline_dentry)
 {
+	FUN_START();
 	struct f2fs_dentry_ptr d;
 	unsigned long bit_pos = 0;
 	int err = 0;
@@ -536,6 +555,7 @@ punch_dentry_pages:
 static int f2fs_move_rehashed_dirents(struct inode *dir, struct folio *ifolio,
 							void *inline_dentry)
 {
+	FUN_START();
 	void *backup_dentry;
 	int err;
 
@@ -586,6 +606,7 @@ recover:
 static int do_convert_inline_dir(struct inode *dir, struct folio *ifolio,
 							void *inline_dentry)
 {
+	FUN_START();
 	if (!F2FS_I(dir)->i_dir_level)
 		return f2fs_move_inline_dirents(dir, ifolio, inline_dentry);
 	else
@@ -594,6 +615,7 @@ static int do_convert_inline_dir(struct inode *dir, struct folio *ifolio,
 
 int f2fs_try_convert_inline_dir(struct inode *dir, struct dentry *dentry)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dir);
 	struct folio *ifolio;
 	struct f2fs_filename fname;
@@ -635,6 +657,7 @@ out:
 int f2fs_add_inline_entry(struct inode *dir, const struct f2fs_filename *fname,
 			  struct inode *inode, nid_t ino, umode_t mode)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dir);
 	struct folio *ifolio;
 	unsigned int bit_pos;
@@ -700,6 +723,7 @@ out:
 void f2fs_delete_inline_entry(struct f2fs_dir_entry *dentry,
 		struct folio *folio, struct inode *dir, struct inode *inode)
 {
+	FUN_START();
 	struct f2fs_dentry_ptr d;
 	void *inline_dentry;
 	int slots = GET_DENTRY_SLOTS(le16_to_cpu(dentry->name_len));
@@ -728,6 +752,7 @@ void f2fs_delete_inline_entry(struct f2fs_dir_entry *dentry,
 
 bool f2fs_empty_inline_dir(struct inode *dir)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dir);
 	struct folio *ifolio;
 	unsigned int bit_pos = 2;
@@ -754,6 +779,7 @@ bool f2fs_empty_inline_dir(struct inode *dir)
 int f2fs_read_inline_dir(struct file *file, struct dir_context *ctx,
 				struct fscrypt_str *fstr)
 {
+	FUN_START();
 	struct inode *inode = file_inode(file);
 	struct folio *ifolio = NULL;
 	struct f2fs_dentry_ptr d;
@@ -790,6 +816,7 @@ int f2fs_read_inline_dir(struct file *file, struct dir_context *ctx,
 int f2fs_inline_data_fiemap(struct inode *inode,
 		struct fiemap_extent_info *fieinfo, __u64 start, __u64 len)
 {
+	FUN_START();
 	__u64 byteaddr, ilen;
 	__u32 flags = FIEMAP_EXTENT_DATA_INLINE | FIEMAP_EXTENT_NOT_ALIGNED |
 		FIEMAP_EXTENT_LAST;
