@@ -13,9 +13,11 @@
 #include "f2fs.h"
 #include "xattr.h"
 #include "acl.h"
+#include "f2fs_printk.h"
 
 static inline size_t f2fs_acl_size(int count)
 {
+	FUN_START();
 	if (count <= 4) {
 		return sizeof(struct f2fs_acl_header) +
 			count * sizeof(struct f2fs_acl_entry_short);
@@ -28,6 +30,7 @@ static inline size_t f2fs_acl_size(int count)
 
 static inline int f2fs_acl_count(size_t size)
 {
+	FUN_START();
 	ssize_t s;
 
 	size -= sizeof(struct f2fs_acl_header);
@@ -45,6 +48,7 @@ static inline int f2fs_acl_count(size_t size)
 
 static struct posix_acl *f2fs_acl_from_disk(const char *value, size_t size)
 {
+	FUN_START();
 	int i, count;
 	struct posix_acl *acl;
 	struct f2fs_acl_header *hdr = (struct f2fs_acl_header *)value;
@@ -113,6 +117,7 @@ fail:
 static void *f2fs_acl_to_disk(struct f2fs_sb_info *sbi,
 				const struct posix_acl *acl, size_t *size)
 {
+	FUN_START();
 	struct f2fs_acl_header *f2fs_acl;
 	struct f2fs_acl_entry *entry;
 	int i;
@@ -168,6 +173,7 @@ fail:
 static struct posix_acl *__f2fs_get_acl(struct inode *inode, int type,
 						struct folio *dfolio)
 {
+	FUN_START();
 	int name_index = F2FS_XATTR_INDEX_POSIX_ACL_DEFAULT;
 	void *value = NULL;
 	struct posix_acl *acl;
@@ -198,6 +204,7 @@ static struct posix_acl *__f2fs_get_acl(struct inode *inode, int type,
 
 struct posix_acl *f2fs_get_acl(struct inode *inode, int type, bool rcu)
 {
+	FUN_START();
 	if (rcu)
 		return ERR_PTR(-ECHILD);
 
@@ -208,6 +215,7 @@ static int f2fs_acl_update_mode(struct mnt_idmap *idmap,
 				struct inode *inode, umode_t *mode_p,
 				struct posix_acl **acl)
 {
+	FUN_START();
 	umode_t mode = inode->i_mode;
 	int error;
 
@@ -229,6 +237,7 @@ static int __f2fs_set_acl(struct mnt_idmap *idmap,
 			struct inode *inode, int type,
 			struct posix_acl *acl, struct folio *ifolio)
 {
+	FUN_START();
 	int name_index;
 	void *value = NULL;
 	size_t size = 0;
@@ -277,6 +286,7 @@ static int __f2fs_set_acl(struct mnt_idmap *idmap,
 int f2fs_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 		 struct posix_acl *acl, int type)
 {
+	FUN_START();
 	struct inode *inode = d_inode(dentry);
 
 	if (unlikely(f2fs_cp_error(F2FS_I_SB(inode))))
@@ -292,6 +302,7 @@ int f2fs_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 static struct posix_acl *f2fs_acl_clone(const struct posix_acl *acl,
 							gfp_t flags)
 {
+	FUN_START();
 	struct posix_acl *clone = NULL;
 
 	if (acl) {
@@ -305,6 +316,7 @@ static struct posix_acl *f2fs_acl_clone(const struct posix_acl *acl,
 
 static int f2fs_acl_create_masq(struct posix_acl *acl, umode_t *mode_p)
 {
+	FUN_START();
 	struct posix_acl_entry *pa, *pe;
 	struct posix_acl_entry *group_obj = NULL, *mask_obj = NULL;
 	umode_t mode = *mode_p;
@@ -361,6 +373,7 @@ static int f2fs_acl_create(struct inode *dir, umode_t *mode,
 		struct posix_acl **default_acl, struct posix_acl **acl,
 		struct folio *dfolio)
 {
+	FUN_START();
 	struct posix_acl *p;
 	struct posix_acl *clone;
 	int ret;
@@ -411,6 +424,7 @@ release_acl:
 int f2fs_init_acl(struct inode *inode, struct inode *dir, struct folio *ifolio,
 							struct folio *dfolio)
 {
+	FUN_START();
 	struct posix_acl *default_acl = NULL, *acl = NULL;
 	int error;
 
