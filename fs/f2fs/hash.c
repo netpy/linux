@@ -16,6 +16,7 @@
 #include <linux/unicode.h>
 
 #include "f2fs.h"
+#include "f2fs_printk.h"
 
 /*
  * Hashing code copied from ext3
@@ -24,6 +25,7 @@
 
 static void TEA_transform(unsigned int buf[4], unsigned int const in[])
 {
+	FUN_START();
 	__u32 sum = 0;
 	__u32 b0 = buf[0], b1 = buf[1];
 	__u32 a = in[0], b = in[1], c = in[2], d = in[3];
@@ -42,6 +44,7 @@ static void TEA_transform(unsigned int buf[4], unsigned int const in[])
 static void str2hashbuf(const unsigned char *msg, size_t len,
 				unsigned int *buf, int num)
 {
+	FUN_START();
 	unsigned pad, val;
 	int i;
 
@@ -69,6 +72,7 @@ static void str2hashbuf(const unsigned char *msg, size_t len,
 
 static u32 TEA_hash_name(const u8 *p, size_t len)
 {
+	FUN_START();
 	__u32 in[8], buf[4];
 
 	/* Initialize the default seed for the hash checksum functions */
@@ -95,6 +99,7 @@ static u32 TEA_hash_name(const u8 *p, size_t len)
  */
 void f2fs_hash_filename(const struct inode *dir, struct f2fs_filename *fname)
 {
+	FUN_START();
 	const u8 *name = fname->disk_name.name;
 	size_t len = fname->disk_name.len;
 
