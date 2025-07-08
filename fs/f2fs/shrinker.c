@@ -11,6 +11,7 @@
 
 #include "f2fs.h"
 #include "node.h"
+#include "f2fs_printk.h"
 
 static LIST_HEAD(f2fs_list);
 static DEFINE_SPINLOCK(f2fs_list_lock);
@@ -18,11 +19,13 @@ static unsigned int shrinker_run_no;
 
 static unsigned long __count_nat_entries(struct f2fs_sb_info *sbi)
 {
+	FUN_START();
 	return NM_I(sbi)->nat_cnt[RECLAIMABLE_NAT];
 }
 
 static unsigned long __count_free_nids(struct f2fs_sb_info *sbi)
 {
+	FUN_START();
 	long count = NM_I(sbi)->nid_cnt[FREE_NID] - MAX_FREE_NIDS;
 
 	return count > 0 ? count : 0;
@@ -31,6 +34,7 @@ static unsigned long __count_free_nids(struct f2fs_sb_info *sbi)
 static unsigned long __count_extent_cache(struct f2fs_sb_info *sbi,
 					enum extent_type type)
 {
+	FUN_START();
 	struct extent_tree_info *eti = &sbi->extent_tree[type];
 
 	return atomic_read(&eti->total_zombie_tree) +
@@ -40,6 +44,7 @@ static unsigned long __count_extent_cache(struct f2fs_sb_info *sbi,
 unsigned long f2fs_shrink_count(struct shrinker *shrink,
 				struct shrink_control *sc)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi;
 	struct list_head *p;
 	unsigned long count = 0;
@@ -79,6 +84,7 @@ unsigned long f2fs_shrink_count(struct shrinker *shrink,
 unsigned long f2fs_shrink_scan(struct shrinker *shrink,
 				struct shrink_control *sc)
 {
+	FUN_START();
 	unsigned long nr = sc->nr_to_scan;
 	struct f2fs_sb_info *sbi;
 	struct list_head *p;
@@ -132,6 +138,7 @@ unsigned long f2fs_shrink_scan(struct shrinker *shrink,
 
 unsigned int f2fs_donate_files(void)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi;
 	struct list_head *p;
 	unsigned int donate_files = 0;
@@ -162,6 +169,7 @@ unsigned int f2fs_donate_files(void)
 static unsigned int do_reclaim_caches(struct f2fs_sb_info *sbi,
 				unsigned int reclaim_caches_kb)
 {
+	FUN_START();
 	struct inode *inode;
 	struct f2fs_inode_info *fi;
 	unsigned int nfiles = sbi->donate_files;
@@ -203,6 +211,7 @@ static unsigned int do_reclaim_caches(struct f2fs_sb_info *sbi,
 
 void f2fs_reclaim_caches(unsigned int reclaim_caches_kb)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi;
 	struct list_head *p;
 
@@ -229,6 +238,7 @@ void f2fs_reclaim_caches(unsigned int reclaim_caches_kb)
 
 void f2fs_join_shrinker(struct f2fs_sb_info *sbi)
 {
+	FUN_START();
 	spin_lock(&f2fs_list_lock);
 	list_add_tail(&sbi->s_list, &f2fs_list);
 	spin_unlock(&f2fs_list_lock);
@@ -236,6 +246,7 @@ void f2fs_join_shrinker(struct f2fs_sb_info *sbi)
 
 void f2fs_leave_shrinker(struct f2fs_sb_info *sbi)
 {
+	FUN_START();
 	f2fs_shrink_read_extent_tree(sbi, __count_extent_cache(sbi, EX_READ));
 	f2fs_shrink_age_extent_tree(sbi,
 				__count_extent_cache(sbi, EX_BLOCK_AGE));
