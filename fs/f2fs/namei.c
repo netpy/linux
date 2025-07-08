@@ -21,10 +21,12 @@
 #include "xattr.h"
 #include "acl.h"
 #include <trace/events/f2fs.h>
+#include "f2fs_printk.h"
 
 static inline bool is_extension_exist(const unsigned char *s, const char *sub,
 						bool tmp_ext, bool tmp_dot)
 {
+	FUN_START();
 	size_t slen = strlen(s);
 	size_t sublen = strlen(sub);
 	int i;
@@ -62,17 +64,20 @@ static inline bool is_extension_exist(const unsigned char *s, const char *sub,
 
 static inline bool is_temperature_extension(const unsigned char *s, const char *sub)
 {
+	FUN_START();
 	return is_extension_exist(s, sub, true, false);
 }
 
 static inline bool is_compress_extension(const unsigned char *s, const char *sub)
 {
+	FUN_START();
 	return is_extension_exist(s, sub, true, true);
 }
 
 int f2fs_update_extension_list(struct f2fs_sb_info *sbi, const char *name,
 							bool hot, bool set)
 {
+	FUN_START();
 	__u8 (*extlist)[F2FS_EXTENSION_LEN] = sbi->raw_super->extension_list;
 	int cold_count = le32_to_cpu(sbi->raw_super->extension_count);
 	int hot_count = sbi->raw_super->hot_ext_count;
@@ -139,6 +144,7 @@ int f2fs_update_extension_list(struct f2fs_sb_info *sbi, const char *name,
 static void set_compress_new_inode(struct f2fs_sb_info *sbi, struct inode *dir,
 				struct inode *inode, const unsigned char *name)
 {
+	FUN_START();
 	__u8 (*extlist)[F2FS_EXTENSION_LEN] = sbi->raw_super->extension_list;
 	unsigned char (*noext)[F2FS_EXTENSION_LEN] =
 						F2FS_OPTION(sbi).noextensions;
@@ -196,6 +202,7 @@ inherit_comp:
 static void set_file_temperature(struct f2fs_sb_info *sbi, struct inode *inode,
 		const unsigned char *name)
 {
+	FUN_START();
 	__u8 (*extlist)[F2FS_EXTENSION_LEN] = sbi->raw_super->extension_list;
 	int i, cold_count, hot_count;
 
@@ -220,6 +227,7 @@ static struct inode *f2fs_new_inode(struct mnt_idmap *idmap,
 						struct inode *dir, umode_t mode,
 						const char *name)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dir);
 	struct f2fs_inode_info *fi;
 	nid_t ino;
@@ -353,6 +361,7 @@ fail_drop:
 static int f2fs_create(struct mnt_idmap *idmap, struct inode *dir,
 		       struct dentry *dentry, umode_t mode, bool excl)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dir);
 	struct inode *inode;
 	nid_t ino = 0;
@@ -399,6 +408,7 @@ out:
 static int f2fs_link(struct dentry *old_dentry, struct inode *dir,
 		struct dentry *dentry)
 {
+	FUN_START();
 	struct inode *inode = d_inode(old_dentry);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dir);
 	int err;
@@ -447,6 +457,7 @@ out:
 
 struct dentry *f2fs_get_parent(struct dentry *child)
 {
+	FUN_START();
 	struct folio *folio;
 	unsigned long ino = f2fs_inode_by_name(d_inode(child), &dotdot_name, &folio);
 
@@ -461,6 +472,7 @@ struct dentry *f2fs_get_parent(struct dentry *child)
 static struct dentry *f2fs_lookup(struct inode *dir, struct dentry *dentry,
 		unsigned int flags)
 {
+	FUN_START();
 	struct inode *inode = NULL;
 	struct f2fs_dir_entry *de;
 	struct folio *folio;
@@ -542,6 +554,7 @@ out:
 
 static int f2fs_unlink(struct inode *dir, struct dentry *dentry)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dir);
 	struct inode *inode = d_inode(dentry);
 	struct f2fs_dir_entry *de;
@@ -610,6 +623,7 @@ static const char *f2fs_get_link(struct dentry *dentry,
 				 struct inode *inode,
 				 struct delayed_call *done)
 {
+	FUN_START();
 	const char *link = page_get_link(dentry, inode, done);
 
 	if (!IS_ERR(link) && !*link) {
@@ -624,6 +638,7 @@ static const char *f2fs_get_link(struct dentry *dentry,
 static int f2fs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 			struct dentry *dentry, const char *symname)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dir);
 	struct inode *inode;
 	size_t len = strlen(symname);
@@ -704,6 +719,7 @@ out_free_encrypted_link:
 static struct dentry *f2fs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 				 struct dentry *dentry, umode_t mode)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dir);
 	struct inode *inode;
 	int err;
@@ -749,6 +765,7 @@ out_fail:
 
 static int f2fs_rmdir(struct inode *dir, struct dentry *dentry)
 {
+	FUN_START();
 	struct inode *inode = d_inode(dentry);
 
 	if (f2fs_empty_dir(inode))
@@ -759,6 +776,7 @@ static int f2fs_rmdir(struct inode *dir, struct dentry *dentry)
 static int f2fs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 		      struct dentry *dentry, umode_t mode, dev_t rdev)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dir);
 	struct inode *inode;
 	int err = 0;
@@ -803,6 +821,7 @@ static int __f2fs_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
 			  struct file *file, umode_t mode, bool is_whiteout,
 			  struct inode **new_inode, struct f2fs_filename *fname)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dir);
 	struct inode *inode;
 	int err;
@@ -872,6 +891,7 @@ out:
 static int f2fs_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
 			struct file *file, umode_t mode)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dir);
 	int err;
 
@@ -889,6 +909,7 @@ static int f2fs_create_whiteout(struct mnt_idmap *idmap,
 				struct inode *dir, struct inode **whiteout,
 				struct f2fs_filename *fname)
 {
+	FUN_START();
 	return __f2fs_tmpfile(idmap, dir, NULL, S_IFCHR | WHITEOUT_MODE,
 						true, whiteout, fname);
 }
@@ -896,6 +917,7 @@ static int f2fs_create_whiteout(struct mnt_idmap *idmap,
 int f2fs_get_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
 		     struct inode **new_inode)
 {
+	FUN_START();
 	return __f2fs_tmpfile(idmap, dir, NULL, S_IFREG,
 				false, new_inode, NULL);
 }
@@ -904,6 +926,7 @@ static int f2fs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 			struct dentry *old_dentry, struct inode *new_dir,
 			struct dentry *new_dentry, unsigned int flags)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(old_dir);
 	struct inode *old_inode = d_inode(old_dentry);
 	struct inode *new_inode = d_inode(new_dentry);
@@ -1099,6 +1122,7 @@ out:
 static int f2fs_cross_rename(struct inode *old_dir, struct dentry *old_dentry,
 			     struct inode *new_dir, struct dentry *new_dentry)
 {
+	FUN_START();
 	struct f2fs_sb_info *sbi = F2FS_I_SB(old_dir);
 	struct inode *old_inode = d_inode(old_dentry);
 	struct inode *new_inode = d_inode(new_dentry);
@@ -1266,6 +1290,7 @@ static int f2fs_rename2(struct mnt_idmap *idmap,
 			struct inode *new_dir, struct dentry *new_dentry,
 			unsigned int flags)
 {
+	FUN_START();
 	int err;
 
 	if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT))
@@ -1298,6 +1323,7 @@ static const char *f2fs_encrypted_get_link(struct dentry *dentry,
 					   struct inode *inode,
 					   struct delayed_call *done)
 {
+	FUN_START();
 	struct page *page;
 	const char *target;
 
@@ -1319,6 +1345,7 @@ static int f2fs_encrypted_symlink_getattr(struct mnt_idmap *idmap,
 					  struct kstat *stat, u32 request_mask,
 					  unsigned int query_flags)
 {
+	FUN_START();
 	f2fs_getattr(idmap, path, stat, request_mask, query_flags);
 
 	return fscrypt_symlink_getattr(path, stat);
