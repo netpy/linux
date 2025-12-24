@@ -631,39 +631,43 @@ static int f2fs_file_open(struct inode *inode, struct file *filp)
 	return finish_preallocate_blocks(inode);
 }
 
+// 按簇粒度批量释放/失效一段数据块
+// 逐槽清地址→合连续块失效→压缩簇单独计数→更新缓存与配额，四步完成批量块释放。
 void f2fs_truncate_data_blocks_range(struct dnode_of_data *dn, int count)
 {
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dn->inode);
 	int nr_free = 0, ofs = dn->ofs_in_node, len = count;
 	__le32 *addr;
-	bool compressed_cluster = false;
-	int cluster_index = 0, valid_blocks = 0;
+	bool compressed_cluster = false;	/* 当前是否处于压缩簇 */
+	int cluster_index = 0, valid_blocks = 0;	/* 压缩簇内有效子块计数 */
 	int cluster_size = F2FS_I(dn->inode)->i_cluster_size;
 	bool released = !atomic_read(&F2FS_I(dn->inode)->i_compr_blocks);
-	block_t blkstart;
-	int blklen = 0;
-
+	block_t blkstart;	/* 连续块起始地址 */
+	int blklen = 0;	/* 连续块长度 */
+	/* 1. 拿到当前 node 页内地址数组指针，起点为 dn->ofs_in_node */
 	addr = get_dnode_addr(dn->inode, dn->node_folio) + ofs;
 	blkstart = le32_to_cpu(*addr);
 
 	/* Assumption: truncation starts with cluster */
+	/* 2. 逐槽位循环：批量释放 count 个块地址 */
+	// 每走到一个压缩簇的第一个页时，进入簇级处理逻辑。
 	for (; count > 0; count--, addr++, dn->ofs_in_node++, cluster_index++) {
 		block_t blkaddr = le32_to_cpu(*addr);
-
+		/* 2a. 每遇到簇首，判断是否是压缩簇并刷新上一簇统计 */
 		if (f2fs_compressed_file(dn->inode) &&
 					!(cluster_index & (cluster_size - 1))) {
 			if (compressed_cluster)
 				f2fs_i_compr_blocks_update(dn->inode,
 							valid_blocks, false);
 			compressed_cluster = (blkaddr == COMPRESS_ADDR);
-			valid_blocks = 0;
+			valid_blocks = 0;	/* 新簇计数器清零 */
 		}
-
+		/* 2b. 已是空洞，无需处理 */
 		if (blkaddr == NULL_ADDR)
 			goto next;
-
+		/* 2c. 把地址表项清成 NULL_ADDR（释放）*/
 		f2fs_set_data_blkaddr(dn, NULL_ADDR);
-
+		/* 2d. 有效物理块 → 做地址合法性检查并计数 */
 		if (__is_valid_data_blkaddr(blkaddr)) {
 			if (time_to_inject(sbi, FAULT_BLKADDR_CONSISTENCE))
 				goto next;
@@ -671,41 +675,46 @@ void f2fs_truncate_data_blocks_range(struct dnode_of_data *dn, int count)
 						DATA_GENERIC_ENHANCE))
 				goto next;
 			if (compressed_cluster)
-				valid_blocks++;
+				valid_blocks++;	/* 压缩簇内有效子块+1 */
 		}
-
+		/* 2e. 合并连续块，一次性失效 */
 		if (blkstart + blklen == blkaddr) {
 			blklen++;
 		} else {
+			/* 不连续，先把前面连续区间失效掉 */
 			f2fs_invalidate_blocks(sbi, blkstart, blklen);
 			blkstart = blkaddr;
 			blklen = 1;
 		}
-
+		/* 2f. 非 release 状态或不是 COMPRESS_ADDR 才计入空闲块总数 */
 		if (!released || blkaddr != COMPRESS_ADDR)
 			nr_free++;
 
 		continue;
 
 next:
-		if (blklen)
+		if (blklen)	/* 2g. 遇到空洞，把前面连续区间立即失效 */
 			f2fs_invalidate_blocks(sbi, blkstart, blklen);
-
+		/* 重置连续块起点/长度 */
 		blkstart = le32_to_cpu(*(addr + 1));
 		blklen = 0;
 	}
 
-	if (blklen)
+	if (blklen)	/* 3. 循环结束，把最后一段连续块失效 */
 		f2fs_invalidate_blocks(sbi, blkstart, blklen);
 
-	if (compressed_cluster)
+	if (compressed_cluster)	/* 4. 如果最后一簇是压缩簇，刷新其有效块计数 */
 		f2fs_i_compr_blocks_update(dn->inode, valid_blocks, false);
 
-	if (nr_free) {
+	if (nr_free) {	/* 5. 有块被释放，更新 extent cache、age cache 和全局有效块计数 */
 		pgoff_t fofs;
 		/*
 		 * once we invalidate valid blkaddr in range [ofs, ofs + count],
 		 * we will invalidate all blkaddr in the whole range.
+		 */
+		/*
+		 * 一次失效 [ofs, ofs + len] 范围内所有块后，
+		 * 同步更新读/age extent cache，并减少配额。
 		 */
 		fofs = f2fs_start_bidx_of_node(ofs_of_node(&dn->node_folio->page),
 							dn->inode) + ofs;
@@ -713,79 +722,85 @@ next:
 		f2fs_update_age_extent_cache_range(dn, fofs, len);
 		dec_valid_block_count(sbi, dn->inode, nr_free);
 	}
-	dn->ofs_in_node = ofs;
+	dn->ofs_in_node = ofs;	/* 6. 恢复 dn->ofs_in_node 到进入函数时的值 */
 
 	f2fs_update_time(sbi, REQ_TIME);
 	trace_f2fs_truncate_data_blocks_range(dn->inode, dn->nid,
 					 dn->ofs_in_node, nr_free);
 }
 
+// 清零文件尾部最后一个不完整页:取页→等写回→清零页尾→标脏（非 cache_only）
 static int truncate_partial_data_page(struct inode *inode, u64 from,
 								bool cache_only)
 {
-	loff_t offset = from & (PAGE_SIZE - 1);
-	pgoff_t index = from >> PAGE_SHIFT;
+	loff_t offset = from & (PAGE_SIZE - 1);	/* from 在页内偏移 */
+	pgoff_t index = from >> PAGE_SHIFT;	/* from 所在页号 */
 	struct address_space *mapping = inode->i_mapping;
 	struct folio *folio;
-
+	/* 1. 若 from 正好页对齐且非 cache_only，无需处理 */
 	if (!offset && !cache_only)
 		return 0;
-
+	/* 2. cache_only 模式：只清缓存页，不强制下盘（用于压缩簇场景）*/
 	if (cache_only) {
 		folio = filemap_lock_folio(mapping, index);
 		if (IS_ERR(folio))
 		       return 0;
+		/* 页已 uptodate 才清零，否则直接放弃 */
 		if (folio_test_uptodate(folio))
 			goto truncate_out;
 		f2fs_folio_put(folio, true);
 		return 0;
 	}
-
+	/* 3. 普通模式：把页读上来并加锁 */
 	folio = f2fs_get_lock_data_folio(inode, index, true);
 	if (IS_ERR(folio))
 		return PTR_ERR(folio) == -ENOENT ? 0 : PTR_ERR(folio);
 truncate_out:
+	/* 4. 等写回结束，再把页内 [offset, 页尾] 清零 */
 	f2fs_folio_wait_writeback(folio, DATA, true, true);
 	folio_zero_segment(folio, offset, folio_size(folio));
 
 	/* An encrypted inode should have a key and truncate the last page. */
+	/* 5. 加密文件必须已有密钥才能清零（cache_only 时跳过）*/
 	f2fs_bug_on(F2FS_I_SB(inode), cache_only && IS_ENCRYPTED(inode));
 	if (!cache_only)
-		folio_mark_dirty(folio);
+		folio_mark_dirty(folio);	/* 普通场景需要标脏落盘 */
 	f2fs_folio_put(folio, true);
 	return 0;
 }
 
+// F2FS 真正释放/扩展数据块
+// 先对齐→设备别名走捷径；inline 直接截；普通块逐 node 释放；最后清零页尾——五步完成块截断。
 int f2fs_do_truncate_blocks(struct inode *inode, u64 from, bool lock)
 {
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct dnode_of_data dn;
-	pgoff_t free_from;
+	pgoff_t free_from;	/* 要释放的起始页号（已按块对齐） */
 	int count = 0, err = 0;
 	struct folio *ifolio;
-	bool truncate_page = false;
+	bool truncate_page = false;	/* 是否需要清零第一页尾部 */
 
 	trace_f2fs_truncate_blocks_enter(inode, from);
-
+	/* 1. 设备别名 inode 不允许非 0 截断（必须一次性全部释放）*/
 	if (IS_DEVICE_ALIASING(inode) && from) {
 		err = -EINVAL;
 		goto out_err;
 	}
-
+	/* 2. 把字节偏移转换成页号，并按块对齐 */
 	free_from = (pgoff_t)F2FS_BLK_ALIGN(from);
-
+	/* 3. 起始页号超出最大文件块 → 只需清零尾部部分页 */
 	if (free_from >= max_file_blocks(inode))
 		goto free_partial;
-
+	/* 4. 需要外锁时先锁住全局 node 操作 */
 	if (lock)
 		f2fs_lock_op(sbi);
-
+	/* 5. 读 inode 页（node page 0）*/
 	ifolio = f2fs_get_inode_folio(sbi, inode->i_ino);
 	if (IS_ERR(ifolio)) {
 		err = PTR_ERR(ifolio);
 		goto out;
 	}
-
+	/* 6. 设备别名 inode → 直接释放 extent 区间，无需按页遍历 */
 	if (IS_DEVICE_ALIASING(inode)) {
 		struct extent_tree *et = F2FS_I(inode)->extent_tree[EX_READ];
 		struct extent_info ei = et->largest;
@@ -798,27 +813,27 @@ int f2fs_do_truncate_blocks(struct inode *inode, u64 from, bool lock)
 		f2fs_folio_put(ifolio, true);
 		goto out;
 	}
-
+	/* 7. inline 数据 → 直接截断 inline 区域，后面只需清零第一页尾部 */
 	if (f2fs_has_inline_data(inode)) {
 		f2fs_truncate_inline_inode(inode, ifolio, from);
 		f2fs_folio_put(ifolio, true);
 		truncate_page = true;
 		goto out;
 	}
-
+	/* 8. 普通块映射：定位到 free_from 所在的 node 页 */
 	set_new_dnode(&dn, inode, ifolio, NULL, 0);
 	err = f2fs_get_dnode_of_data(&dn, free_from, LOOKUP_NODE_RA);
 	if (err) {
-		if (err == -ENOENT)
+		if (err == -ENOENT)	/* 该 node 不存在 → 只需处理尾部 */
 			goto free_next;
 		goto out;
 	}
-
+	/* 9. 计算当前 node 页内剩余要释放的槽位数 */
 	count = ADDRS_PER_PAGE(&dn.node_folio->page, inode);
 
 	count -= dn.ofs_in_node;
 	f2fs_bug_on(sbi, count < 0);
-
+	/* 10. 如果当前 node 不是从头开始，先释放本页剩余槽位 */
 	if (dn.ofs_in_node || IS_INODE(&dn.node_folio->page)) {
 		f2fs_truncate_data_blocks_range(&dn, count);
 		free_from += count;
@@ -826,22 +841,25 @@ int f2fs_do_truncate_blocks(struct inode *inode, u64 from, bool lock)
 
 	f2fs_put_dnode(&dn);
 free_next:
+	/* 11. 继续释放后续所有 node 页（级联间接块）*/
 	err = f2fs_truncate_inode_blocks(inode, free_from);
 out:
 	if (lock)
 		f2fs_unlock_op(sbi);
 free_partial:
 	/* lastly zero out the first data page */
-	if (!err)
+	if (!err)	/* 12. 最后清零第一页尾部多余数据（inline 或普通页）*/
 		err = truncate_partial_data_page(inode, from, truncate_page);
 out_err:
 	trace_f2fs_truncate_blocks_exit(inode, err);
 	return err;
 }
 
+// F2FS 截断数据块的顶层分发器
+// 压缩文件先簇对齐释放，再处理尾部部分簇；截到 0 时清 RELEASED 标记——三步完成截断。
 int f2fs_truncate_blocks(struct inode *inode, u64 from, bool lock)
 {
-	u64 free_from = from;
+	u64 free_from = from;	/* 默认从 from 开始释放 */
 	int err;
 
 #ifdef CONFIG_F2FS_FS_COMPRESSION
@@ -849,11 +867,16 @@ int f2fs_truncate_blocks(struct inode *inode, u64 from, bool lock)
 	 * for compressed file, only support cluster size
 	 * aligned truncation.
 	 */
+	/*
+	 * 压缩文件只支持“簇对齐”截断；若 from 未对齐，
+	 * 先把 free_from 向上对齐到簇边界，剩余尾部由
+	 * f2fs_truncate_partial_cluster() 单独处理。
+	 */
 	if (f2fs_compressed_file(inode))
 		free_from = round_up(from,
 				F2FS_I(inode)->i_cluster_size << PAGE_SHIFT);
 #endif
-
+	/* 1. 真正释放/扩展数据块（支持普通块、压缩簇、空洞混合场景）*/
 	err = f2fs_do_truncate_blocks(inode, free_from, lock);
 	if (err)
 		return err;
@@ -863,10 +886,14 @@ int f2fs_truncate_blocks(struct inode *inode, u64 from, bool lock)
 	 * For compressed file, after release compress blocks, don't allow write
 	 * direct, but we should allow write direct after truncate to zero.
 	 */
+	/*
+	 * 截断到 0 的特殊情况：之前 release 过压缩块，现在允许重新写，
+	 * 因此清掉 FI_COMPRESS_RELEASED 标记。
+	 */
 	if (f2fs_compressed_file(inode) && !free_from
 			&& is_inode_flag_set(inode, FI_COMPRESS_RELEASED))
 		clear_inode_flag(inode, FI_COMPRESS_RELEASED);
-
+	/* 2. 若 from 未簇对齐，还需对尾部部分簇做“解压→清零→重压缩” */
 	if (from != free_from) {
 		err = f2fs_truncate_partial_cluster(inode, from, lock);
 		if (err)
@@ -877,37 +904,41 @@ int f2fs_truncate_blocks(struct inode *inode, u64 from, bool lock)
 	return 0;
 }
 
+// F2FS 截断文件/目录/软链的顶层入口
+// 先容错→转 inline→截断块→更新时间戳，四步完成文件/目录/软链截断。
 int f2fs_truncate(struct inode *inode)
 {
 	int err;
-
+	/* 1. 检查点出错 → 立即返回 -EIO，拒绝写操作 */
 	if (unlikely(f2fs_cp_error(F2FS_I_SB(inode))))
 		return -EIO;
-
+	/* 2. 只处理普通文件/目录/软链，其余类型直接成功 */
 	if (!(S_ISREG(inode->i_mode) || S_ISDIR(inode->i_mode) ||
 				S_ISLNK(inode->i_mode)))
 		return 0;
 
-	trace_f2fs_truncate(inode);
-
+	trace_f2fs_truncate(inode);	/* trace 打点 */
+	/* 3. 故障注入测试点 */
 	if (time_to_inject(F2FS_I_SB(inode), FAULT_TRUNCATE))
 		return -EIO;
-
+	/* 4. 初始化配额（dquot）环境，防止截断后超限 */
 	err = f2fs_dquot_initialize(inode);
 	if (err)
 		return err;
 
 	/* we should check inline_data size */
+	/* 5. 如果文件当前是 inline 数据且新大小放不下了，先转成普通块映射 */
 	if (!f2fs_may_inline_data(inode)) {
 		err = f2fs_convert_inline_inode(inode);
 		if (err)
 			return err;
 	}
-
+	/* 6. 真正释放/扩展数据块（支持压缩簇、普通块、空洞混合场景）*/
+	// i_size_read返回文件占用的字节数量，在进入这段逻辑之前，已经设置对应的值
 	err = f2fs_truncate_blocks(inode, i_size_read(inode), true);
 	if (err)
 		return err;
-
+	/* 7. 更新 mtime/ctime 并刷 inode 到磁盘 */
 	inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode));
 	f2fs_mark_inode_dirty_sync(inode, false);
 	return 0;
@@ -3722,40 +3753,47 @@ out:
 	return err;
 }
 
+// 拿到文件压缩后实际占用的块数
 static int f2fs_get_compress_blocks(struct inode *inode, __u64 *blocks)
 {
+	/* 1. 文件系统没开压缩特性 → 直接报错 */
 	if (!f2fs_sb_has_compression(F2FS_I_SB(inode)))
 		return -EOPNOTSUPP;
-
+	/* 2. 文件本身没开压缩 → 返回无效参数 */
 	if (!f2fs_compressed_file(inode))
 		return -EINVAL;
-
+	/* 3. 返回已统计好的压缩块数（原子变量，单位：F2FS 块） */
 	*blocks = atomic_read(&F2FS_I(inode)->i_compr_blocks);
 
 	return 0;
 }
 
+// ioctl 获取文件压缩后实际占用块数
 static int f2fs_ioc_get_compress_blocks(struct file *filp, unsigned long arg)
 {
-	struct inode *inode = file_inode(filp);
-	__u64 blocks;
+	struct inode *inode = file_inode(filp);	/* 取文件 inode */
+	__u64 blocks;	/* 压缩后实际块数（单位：F2FS 块） */
 	int ret;
 
+	/* 1. 底层统计：遍历所有压缩簇，累加物理块数 */
 	ret = f2fs_get_compress_blocks(inode, &blocks);
 	if (ret < 0)
-		return ret;
+		return ret;	/* 文件未压缩或出错 */
 
+	/* 2. 把结果拷回用户空间 */
 	return put_user(blocks, (u64 __user *)arg);
 }
 
+// 把一段压缩簇占用的物理块全部释放回空闲池
+// 先校验地址，再按簇循环：第0块必须是COMPRESS_ADDR，其余真实块统计后把差值归还空闲池——三步完成压缩块释放。
 static int release_compress_blocks(struct dnode_of_data *dn, pgoff_t count)
 {
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dn->inode);
-	unsigned int released_blocks = 0;
-	int cluster_size = F2FS_I(dn->inode)->i_cluster_size;
+	unsigned int released_blocks = 0;	/* 本函数累计释放块数 */
+	int cluster_size = F2FS_I(dn->inode)->i_cluster_size;	/* 压缩簇大小（页数） */
 	block_t blkaddr;
 	int i;
-
+	/* 1. 先扫一遍地址表，做一致性检查：遇到非法块号直接报错 */
 	for (i = 0; i < count; i++) {
 		blkaddr = data_blkaddr(dn->inode, dn->node_folio,
 						dn->ofs_in_node + i);
@@ -3766,65 +3804,70 @@ static int release_compress_blocks(struct dnode_of_data *dn, pgoff_t count)
 					DATA_GENERIC_ENHANCE)))
 			return -EFSCORRUPTED;
 	}
-
+	/* 2. 按簇粒度循环释放 */
 	while (count) {
-		int compr_blocks = 0;
+		int compr_blocks = 0;	/* 本簇内实际占用（非 NEW_ADDR）子块数 */
 
+		/* 2a. 逐子块处理当前簇 */
 		for (i = 0; i < cluster_size; i++, dn->ofs_in_node++) {
 			blkaddr = f2fs_data_blkaddr(dn);
-
+			/* 第 0 块特殊：必须是 COMPRESS_ADDR，否则跳过整簇 */
 			if (i == 0) {
 				if (blkaddr == COMPRESS_ADDR)
-					continue;
-				dn->ofs_in_node += cluster_size;
+					continue;	/* 正常占位，继续 */
+				dn->ofs_in_node += cluster_size;	/* 非压缩簇，直接跳到下一簇起始 */
 				goto next;
 			}
-
+			/* 2b. 统计本簇内真实占用块数 */
 			if (__is_valid_data_blkaddr(blkaddr))
 				compr_blocks++;
-
+			/* 2c. 把 NEW_ADDR 改成 NULL_ADDR（释放未写块）*/
 			if (blkaddr != NEW_ADDR)
 				continue;
 
 			f2fs_set_data_blkaddr(dn, NULL_ADDR);
 		}
-
+		/* 2d. 更新 inode 级压缩块计数 */
 		f2fs_i_compr_blocks_update(dn->inode, compr_blocks, false);
+		/* 2e. 把“簇大小 - 真实占用”块归还全局空闲计数 */
 		dec_valid_block_count(sbi, dn->inode,
 					cluster_size - compr_blocks);
 
-		released_blocks += cluster_size - compr_blocks;
+		released_blocks += cluster_size - compr_blocks;	/* 累加释放数 */
 next:
-		count -= cluster_size;
+		count -= cluster_size;	/* 处理完一簇，剩余页数递减 */
 	}
 
-	return released_blocks;
+	return released_blocks;	/* 返回本次总共释放的块数 */
 }
 
+// 把文件已压缩占用的块全部释放回空闲池
+// 独占写→刷脏→按簇循环释放块→打标记；部分失败提醒 fsck，成功把块数拷给用户。
 static int f2fs_release_compress_blocks(struct file *filp, unsigned long arg)
 {
 	struct inode *inode = file_inode(filp);
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
-	pgoff_t page_idx = 0, last_idx;
-	unsigned int released_blocks = 0;
+	pgoff_t page_idx = 0, last_idx;	/* 当前页号、文件最后一页 */
+	unsigned int released_blocks = 0;	/* 累计已释放块数 */
 	int ret;
 	int writecount;
-
+	/* 1. 文件系统没开压缩 || 只读 → 直接报错 */
 	if (!f2fs_sb_has_compression(sbi))
 		return -EOPNOTSUPP;
 
 	if (f2fs_readonly(sbi->sb))
 		return -EROFS;
-
+	/* 2. 申请写权限（mnt_want_write）*/
 	ret = mnt_want_write_file(filp);
 	if (ret)
 		return ret;
 
-	f2fs_balance_fs(sbi, true);
+	f2fs_balance_fs(sbi, true);	/* 先尝试触发 GC 腾空间 */
 
-	inode_lock(inode);
+	inode_lock(inode);	/* 大锁保护 */
 
+	/* 3. 必须独占写：要么本 fd 是唯一写者，要么没有任何写者 */
 	writecount = atomic_read(&inode->i_writecount);
 	if ((filp->f_mode & FMODE_WRITE && writecount != 1) ||
 			(!(filp->f_mode & FMODE_WRITE) && writecount)) {
@@ -3832,41 +3875,43 @@ static int f2fs_release_compress_blocks(struct file *filp, unsigned long arg)
 		goto out;
 	}
 
+	/* 4. 文件未压缩 || 已释放过 → 无效 */
 	if (!f2fs_compressed_file(inode) ||
 		is_inode_flag_set(inode, FI_COMPRESS_RELEASED)) {
 		ret = -EINVAL;
 		goto out;
 	}
 
+	/* 5. 把脏数据刷干净，避免释放过程中再写盘 */
 	ret = filemap_write_and_wait_range(inode->i_mapping, 0, LLONG_MAX);
 	if (ret)
 		goto out;
-
+	/* 6. 压缩块计数为 0 → 无块可放 */
 	if (!atomic_read(&fi->i_compr_blocks)) {
 		ret = -EPERM;
 		goto out;
 	}
-
+	/* 7. 打标记、更新时间戳、刷 inode */
 	set_inode_flag(inode, FI_COMPRESS_RELEASED);
 	inode_set_ctime_current(inode);
 	f2fs_mark_inode_dirty_sync(inode, true);
-
+	/* 8. 进入“写侧” GC 信号量，禁止并发 GC 移动这些块 */
 	f2fs_down_write(&fi->i_gc_rwsem[WRITE]);
-	filemap_invalidate_lock(inode->i_mapping);
+	filemap_invalidate_lock(inode->i_mapping);	/* 防止读缓存与释放竞争 */
 
 	last_idx = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
-
+	/* 9. 按簇粒度循环释放 */
 	while (page_idx < last_idx) {
 		struct dnode_of_data dn;
 		pgoff_t end_offset, count;
 
-		f2fs_lock_op(sbi);
+		f2fs_lock_op(sbi);	/* 锁住 node 操作 */
 
 		set_new_dnode(&dn, inode, NULL, NULL, 0);
 		ret = f2fs_get_dnode_of_data(&dn, page_idx, LOOKUP_NODE);
 		if (ret) {
 			f2fs_unlock_op(sbi);
-			if (ret == -ENOENT) {
+			if (ret == -ENOENT) {	/* 空洞节点，跳过继续 */
 				page_idx = f2fs_get_next_page_offset(&dn,
 								page_idx);
 				ret = 0;
@@ -3874,11 +3919,11 @@ static int f2fs_release_compress_blocks(struct file *filp, unsigned long arg)
 			}
 			break;
 		}
-
+		/* 当前 node 页内最大槽位 & 剩余页数 → 取小，再按簇对齐 */
 		end_offset = ADDRS_PER_PAGE(&dn.node_folio->page, inode);
 		count = min(end_offset - dn.ofs_in_node, last_idx - page_idx);
 		count = round_up(count, fi->i_cluster_size);
-
+		/* 真正释放这些簇占用的物理块 */
 		ret = release_compress_blocks(&dn, count);
 
 		f2fs_put_dnode(&dn);
@@ -3889,18 +3934,18 @@ static int f2fs_release_compress_blocks(struct file *filp, unsigned long arg)
 			break;
 
 		page_idx += count;
-		released_blocks += ret;
+		released_blocks += ret;	/* ret 返回本次释放的块数 */
 	}
 
 	filemap_invalidate_unlock(inode->i_mapping);
 	f2fs_up_write(&fi->i_gc_rwsem[WRITE]);
 out:
-	if (released_blocks)
+	if (released_blocks)	/* 更新耗时统计 */
 		f2fs_update_time(sbi, REQ_TIME);
 	inode_unlock(inode);
 
-	mnt_drop_write_file(filp);
-
+	mnt_drop_write_file(filp);	/* 归还写权限 */
+	/* 10. 成功则把释放块数拷到用户空间；部分失败则打标志提醒 fsck */
 	if (ret >= 0) {
 		ret = put_user(released_blocks, (u64 __user *)arg);
 	} else if (released_blocks &&
@@ -3917,14 +3962,16 @@ out:
 	return ret;
 }
 
+// 为一段已释放的压缩簇重新占用物理块
+// 按簇扫描：第0块须为COMPRESS_ADDR，统计已存在块数→申请差值→把NULL_ADDR改NEW_ADDR→更新压缩计数，四步完成重新占用。
 static int reserve_compress_blocks(struct dnode_of_data *dn, pgoff_t count,
 		unsigned int *reserved_blocks)
 {
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dn->inode);
-	int cluster_size = F2FS_I(dn->inode)->i_cluster_size;
+	int cluster_size = F2FS_I(dn->inode)->i_cluster_size;	/* 压缩簇大小（页数） */
 	block_t blkaddr;
 	int i;
-
+	/* 1. 先扫一遍地址表，做一致性检查：遇到非法块号直接报错 */
 	for (i = 0; i < count; i++) {
 		blkaddr = data_blkaddr(dn->inode, dn->node_folio,
 						dn->ofs_in_node + i);
@@ -3935,17 +3982,17 @@ static int reserve_compress_blocks(struct dnode_of_data *dn, pgoff_t count,
 					DATA_GENERIC_ENHANCE)))
 			return -EFSCORRUPTED;
 	}
-
+	/* 2. 按簇粒度循环：把之前 release 时清成 NULL_ADDR 的槽位重新占回来 */
 	while (count) {
-		int compr_blocks = 0;
-		blkcnt_t reserved = 0;
-		blkcnt_t to_reserved;
+		int compr_blocks = 0;	/* 本簇内已存在（未释放）的子块数 */
+		blkcnt_t reserved = 0;	/* 本簇内已是 NEW_ADDR 的子块数 */
+		blkcnt_t to_reserved;	/* 本簇还需要新占用的块数 */
 		int ret;
-
+		/* 2a. 逐子块扫描当前簇 */
 		for (i = 0; i < cluster_size; i++) {
 			blkaddr = data_blkaddr(dn->inode, dn->node_folio,
 						dn->ofs_in_node + i);
-
+			/* 第 0 块必须是 COMPRESS_ADDR，否则跳过整簇 */
 			if (i == 0) {
 				if (blkaddr != COMPRESS_ADDR) {
 					dn->ofs_in_node += cluster_size;
@@ -3959,92 +4006,98 @@ static int reserve_compress_blocks(struct dnode_of_data *dn, pgoff_t count,
 			 * fails in release_compress_blocks(), so NEW_ADDR
 			 * is a possible case.
 			 */
-			if (blkaddr == NEW_ADDR) {
+			if (blkaddr == NEW_ADDR) {	/* NEW_ADDR：之前没释放成功，无需再占 */
 				reserved++;
 				continue;
 			}
+			/* 真实块号：统计未释放块数 */
 			if (__is_valid_data_blkaddr(blkaddr)) {
 				compr_blocks++;
 				continue;
 			}
 		}
-
+		/* 2b. 计算本簇还需要新占多少块 */
 		to_reserved = cluster_size - compr_blocks - reserved;
 
 		/* for the case all blocks in cluster were reserved */
+		/* 边界情况：只剩 1 块且全是 NEW_ADDR → 无需再占，直接跳过 */
 		if (reserved && to_reserved == 1) {
 			dn->ofs_in_node += cluster_size;
 			goto next;
 		}
-
+		/* 2c. 向全局配额申请 to_reserved 块（可能触发 GC）*/
 		ret = inc_valid_block_count(sbi, dn->inode,
 						&to_reserved, false);
 		if (unlikely(ret))
 			return ret;
-
+		/* 2d. 把本簇内所有 NULL_ADDR 改回 NEW_ADDR（已占好配额）*/
 		for (i = 0; i < cluster_size; i++, dn->ofs_in_node++) {
 			if (f2fs_data_blkaddr(dn) == NULL_ADDR)
 				f2fs_set_data_blkaddr(dn, NEW_ADDR);
 		}
-
+		/* 2e. 更新 inode 级压缩块计数（累加 compr_blocks）*/
 		f2fs_i_compr_blocks_update(dn->inode, compr_blocks, true);
 
-		*reserved_blocks += to_reserved;
+		*reserved_blocks += to_reserved;	/* 累加本次占用块数 */
 next:
-		count -= cluster_size;
+		count -= cluster_size;	/* 处理完一簇，剩余页数递减 */
 	}
 
 	return 0;
 }
 
+// 把已释放的压缩块重新占回来（reserve）
+// 必须已压缩且已 release → 按簇把 NULL_ADDR 重新占回来 → 清标记；失败打 fsck 提醒。
 static int f2fs_reserve_compress_blocks(struct file *filp, unsigned long arg)
 {
 	struct inode *inode = file_inode(filp);
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
-	pgoff_t page_idx = 0, last_idx;
-	unsigned int reserved_blocks = 0;
+	pgoff_t page_idx = 0, last_idx;	/* 当前页号、文件最后一页 */
+	unsigned int reserved_blocks = 0;	/* 累计重新占用的块数 */
 	int ret;
 
+	/* 1. 文件系统没开压缩 || 只读 → 直接报错 */
 	if (!f2fs_sb_has_compression(sbi))
 		return -EOPNOTSUPP;
 
 	if (f2fs_readonly(sbi->sb))
 		return -EROFS;
-
+	/* 2. 申请写权限 */
 	ret = mnt_want_write_file(filp);
 	if (ret)
 		return ret;
 
-	f2fs_balance_fs(sbi, true);
+	f2fs_balance_fs(sbi, true);	/* 先尝试 GC 腾空间 */
 
-	inode_lock(inode);
+	inode_lock(inode);	/* 大锁 */
 
+	/* 3. 必须已压缩且已标记 FI_COMPRESS_RELEASED，否则无效 */
 	if (!f2fs_compressed_file(inode) ||
 		!is_inode_flag_set(inode, FI_COMPRESS_RELEASED)) {
 		ret = -EINVAL;
 		goto unlock_inode;
 	}
-
+	/* 4. 如果压缩块计数已非 0，说明已 reserve 过，直接退出 */
 	if (atomic_read(&fi->i_compr_blocks))
 		goto unlock_inode;
 
-	f2fs_down_write(&fi->i_gc_rwsem[WRITE]);
+	f2fs_down_write(&fi->i_gc_rwsem[WRITE]);	/* 禁止并发 GC 移动这些块 */
 	filemap_invalidate_lock(inode->i_mapping);
 
 	last_idx = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
-
+	/* 5. 按簇粒度循环：把之前 release 时清成 NULL_ADDR 的槽位重新占回来 */
 	while (page_idx < last_idx) {
 		struct dnode_of_data dn;
 		pgoff_t end_offset, count;
 
-		f2fs_lock_op(sbi);
+		f2fs_lock_op(sbi);	/* 锁住 node 操作 */
 
 		set_new_dnode(&dn, inode, NULL, NULL, 0);
 		ret = f2fs_get_dnode_of_data(&dn, page_idx, LOOKUP_NODE);
 		if (ret) {
 			f2fs_unlock_op(sbi);
-			if (ret == -ENOENT) {
+			if (ret == -ENOENT) {	/* 空洞节点，跳过继续 */
 				page_idx = f2fs_get_next_page_offset(&dn,
 								page_idx);
 				ret = 0;
@@ -4052,11 +4105,11 @@ static int f2fs_reserve_compress_blocks(struct file *filp, unsigned long arg)
 			}
 			break;
 		}
-
+		/* 当前 node 页内最大槽位 & 剩余页数 → 取小，再按簇对齐 */
 		end_offset = ADDRS_PER_PAGE(&dn.node_folio->page, inode);
 		count = min(end_offset - dn.ofs_in_node, last_idx - page_idx);
 		count = round_up(count, fi->i_cluster_size);
-
+		/* 真正重新占用这些槽位（把 NULL_ADDR 改回 NEW_ADDR 或直接分配块）*/
 		ret = reserve_compress_blocks(&dn, count, &reserved_blocks);
 
 		f2fs_put_dnode(&dn);
@@ -4066,12 +4119,12 @@ static int f2fs_reserve_compress_blocks(struct file *filp, unsigned long arg)
 		if (ret < 0)
 			break;
 
-		page_idx += count;
+		page_idx += count;	/* ret 返回本次占用的块数 */
 	}
 
 	filemap_invalidate_unlock(inode->i_mapping);
 	f2fs_up_write(&fi->i_gc_rwsem[WRITE]);
-
+	/* 6. 全部成功 → 清标记、更新时间戳、刷 inode */
 	if (!ret) {
 		clear_inode_flag(inode, FI_COMPRESS_RELEASED);
 		inode_set_ctime_current(inode);
@@ -4079,10 +4132,10 @@ static int f2fs_reserve_compress_blocks(struct file *filp, unsigned long arg)
 	}
 unlock_inode:
 	if (reserved_blocks)
-		f2fs_update_time(sbi, REQ_TIME);
+		f2fs_update_time(sbi, REQ_TIME);	/* 更新耗时统计 */
 	inode_unlock(inode);
-	mnt_drop_write_file(filp);
-
+	mnt_drop_write_file(filp);	/* 归还写权限 */
+	/* 7. 成功则把占用块数拷到用户空间；部分失败则打标志提醒 fsck */
 	if (!ret) {
 		ret = put_user(reserved_blocks, (u64 __user *)arg);
 	} else if (reserved_blocks &&
@@ -4289,26 +4342,28 @@ err:
 	return ret;
 }
 
+// ioctl 获取文件压缩参数
+// 系统开压缩且文件已压缩 → 拿算法/簇大小拷给用户，否则报错。
 static int f2fs_ioc_get_compress_option(struct file *filp, unsigned long arg)
 {
 	struct inode *inode = file_inode(filp);
-	struct f2fs_comp_option option;
-
+	struct f2fs_comp_option option;	/* 用户可见结构体 */
+	/* 1. 文件系统没开压缩特性 → 直接报错 */
 	if (!f2fs_sb_has_compression(F2FS_I_SB(inode)))
 		return -EOPNOTSUPP;
 
-	inode_lock_shared(inode);
-
+	inode_lock_shared(inode);	/* 共享锁，防止并发修改压缩标志 */
+	/* 共享锁，防止并发修改压缩标志 */
 	if (!f2fs_compressed_file(inode)) {
 		inode_unlock_shared(inode);
 		return -ENODATA;
 	}
-
+	/* 3. 填充算法编号与簇大小指数 */
 	option.algorithm = F2FS_I(inode)->i_compress_algorithm;
 	option.log_cluster_size = F2FS_I(inode)->i_log_cluster_size;
 
 	inode_unlock_shared(inode);
-
+	/* 4. 拷到用户空间 */
 	if (copy_to_user((struct f2fs_comp_option __user *)arg, &option,
 				sizeof(option)))
 		return -EFAULT;
@@ -4316,35 +4371,38 @@ static int f2fs_ioc_get_compress_option(struct file *filp, unsigned long arg)
 	return 0;
 }
 
+// 通过 ioctl 在线修改文件的压缩算法与簇大小
+// 空文件、无 mmap、无脏页、写打开 → 拷参数、合法性检查、写 inode、刷脏，算法不支持仅警告。
 static int f2fs_ioc_set_compress_option(struct file *filp, unsigned long arg)
 {
 	struct inode *inode = file_inode(filp);
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
-	struct f2fs_comp_option option;
+	struct f2fs_comp_option option;	/* 用户传入的新参数 */
 	int ret = 0;
-
+	/* 1. 文件系统没开压缩特性 → 直接报错 */
 	if (!f2fs_sb_has_compression(sbi))
 		return -EOPNOTSUPP;
-
+	/* 2. 文件必须是写打开，否则无权修改 inode 元数据 */
 	if (!(filp->f_mode & FMODE_WRITE))
 		return -EBADF;
-
+	/* 3. 从用户空间拷入新参数 */
 	if (copy_from_user(&option, (struct f2fs_comp_option __user *)arg,
 				sizeof(option)))
 		return -EFAULT;
-
+	/* 4. 参数合法性检查：簇大小、算法编号必须在允许范围内 */
 	if (option.log_cluster_size < MIN_COMPRESS_LOG_SIZE ||
 		option.log_cluster_size > MAX_COMPRESS_LOG_SIZE ||
 		option.algorithm >= COMPRESS_MAX)
 		return -EINVAL;
-
+	/* 5. 申请写权限（mnt_want_write）*/
 	ret = mnt_want_write_file(filp);
 	if (ret)
 		return ret;
-	inode_lock(inode);
+	inode_lock(inode);	/*  inode 级大锁 */
 
-	f2fs_down_write(&F2FS_I(inode)->i_sem);
+	f2fs_down_write(&F2FS_I(inode)->i_sem);	/* 压缩字段写锁 */
+	/* 6. 必须已标记为压缩文件，且当前无 mmap、无脏页、无数据块，否则拒绝 */
 	if (!f2fs_compressed_file(inode)) {
 		ret = -EINVAL;
 		goto out;
@@ -4354,26 +4412,29 @@ static int f2fs_ioc_set_compress_option(struct file *filp, unsigned long arg)
 		ret = -EBUSY;
 		goto out;
 	}
-
+	/* 已有数据 → 不允许改参数 */
 	if (F2FS_HAS_BLOCKS(inode)) {
 		ret = -EFBIG;
 		goto out;
 	}
-
+	/* 7. 正式写入新参数 */
 	fi->i_compress_algorithm = option.algorithm;
 	fi->i_log_cluster_size = option.log_cluster_size;
+	/* 2^log */
 	fi->i_cluster_size = BIT(option.log_cluster_size);
 	/* Set default level */
+	/* 8. 设置默认压缩级别 */
 	if (fi->i_compress_algorithm == COMPRESS_ZSTD)
 		fi->i_compress_level = F2FS_ZSTD_DEFAULT_CLEVEL;
 	else
 		fi->i_compress_level = 0;
 	/* Adjust mount option level */
+	/* 9. 若与挂载选项一致且挂载时指定了级别，则采用挂载级别 */
 	if (option.algorithm == F2FS_OPTION(sbi).compress_algorithm &&
 	    F2FS_OPTION(sbi).compress_level)
 		fi->i_compress_level = F2FS_OPTION(sbi).compress_level;
-	f2fs_mark_inode_dirty_sync(inode, true);
-
+	f2fs_mark_inode_dirty_sync(inode, true);	/* 10. 标记 inode 脏，立即刷出 */
+	/* 11. 若内核未编译对应算法，仅警告但不报错（设置仍成功）*/
 	if (!f2fs_is_compress_backend_ready(inode))
 		f2fs_warn(sbi, "compression algorithm is successfully set, "
 			"but current kernel doesn't support this algorithm.");
@@ -4385,6 +4446,7 @@ out:
 	return ret;
 }
 
+// 将一段文件数据对应的 page/folio 重新标记为 dirty，并打上 GC 私有标记，从而强制它们在后续写回时 被重新写入新的物理块。
 static int redirty_blocks(struct inode *inode, pgoff_t page_idx, int len)
 {
 	DEFINE_READAHEAD(ractl, NULL, NULL, inode->i_mapping, page_idx);
@@ -4393,19 +4455,27 @@ static int redirty_blocks(struct inode *inode, pgoff_t page_idx, int len)
 	pgoff_t redirty_idx = page_idx;
 	int page_len = 0, ret = 0;
 
+	// 第一阶段：确保 folio 都在 page cache 中
+	// 触发 readahead:保证 [page_idx, page_idx + len) 对应的 folio 都被拉入 page cache
+	// 注意：解压就是在此时完成的，该函数底层调用f2fs_readahead函数，就会触发解压
 	page_cache_ra_unbounded(&ractl, len, 0);
 
+	// 第二阶段：逐个读取 folio，计算结束位置
 	do {
 		folio = read_cache_folio(mapping, page_idx, NULL, NULL);
 		if (IS_ERR(folio)) {
 			ret = PTR_ERR(folio);
 			break;
 		}
+		// 覆盖 len 个 page：处理 large folio 的边界问题，得到最终的 page_idx 上限
 		page_len += folio_nr_pages(folio) - (page_idx - folio->index);
 		page_idx = folio_next_index(folio);
 	} while (page_len < len);
 
+	// 第三阶段（核心）：redirty + GC 标记
 	do {
+		// 将 folio 标记为 dirty，意味着：当前磁盘上的数据“不再是最终版本”
+		// writeback 时必须重新分配 block
 		folio = filemap_lock_folio(mapping, redirty_idx);
 
 		/* It will never fail, when folio has pinned above */
@@ -4414,6 +4484,10 @@ static int redirty_blocks(struct inode *inode, pgoff_t page_idx, int len)
 		f2fs_folio_wait_writeback(folio, DATA, true, true);
 
 		folio_mark_dirty(folio);
+		// 表示：这是 GC 触发的写回
+		// 后续在 writeback / block allocation 路径中：
+		// 走 GC-aware 的分配策略
+		// 影响 valid/invalid block 的更新逻辑
 		set_page_private_gcing(&folio->page);
 		redirty_idx = folio_next_index(folio);
 		folio_unlock(folio);
@@ -4423,6 +4497,9 @@ static int redirty_blocks(struct inode *inode, pgoff_t page_idx, int len)
 	return ret;
 }
 
+// 把整文件从压缩状态还原成普通数据（在线解压）
+// F2FS 的 decompress ioctl 是通过“强制重写所有压缩 cluster”，让文件自然变成非压缩格式。
+// 用户模式 + 写打开 → 刷脏 → 逐簇标脏触发解压写回 → 再刷盘；失败提醒删文件。
 static int f2fs_ioc_decompress_file(struct file *filp)
 {
 	struct inode *inode = file_inode(filp);
@@ -4430,21 +4507,21 @@ static int f2fs_ioc_decompress_file(struct file *filp)
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	pgoff_t page_idx = 0, last_idx, cluster_idx;
 	int ret;
-
+	/* 1. 文件系统没开压缩 **或** 压缩模式不是用户可控 → 报错 */
 	if (!f2fs_sb_has_compression(sbi) ||
 			F2FS_OPTION(sbi).compress_mode != COMPR_MODE_USER)
 		return -EOPNOTSUPP;
-
+	/* 2. 必须写打开，否则无权修改数据 */
 	if (!(filp->f_mode & FMODE_WRITE))
 		return -EBADF;
 
-	f2fs_balance_fs(sbi, true);
+	f2fs_balance_fs(sbi, true);	/* 先尝试 GC 腾空间 */
 
 	ret = mnt_want_write_file(filp);
 	if (ret)
 		return ret;
-	inode_lock(inode);
-
+	inode_lock(inode);	/* inode 大锁 */
+	/* 3. 后端未就绪 / 文件未压缩 / 已标记 RELEASED → 无效 */
 	if (!f2fs_is_compress_backend_ready(inode)) {
 		ret = -EOPNOTSUPP;
 		goto out;
@@ -4455,48 +4532,48 @@ static int f2fs_ioc_decompress_file(struct file *filp)
 		ret = -EINVAL;
 		goto out;
 	}
-
+	/* 4. 刷干净所有脏页，避免解压过程中再写盘 */
 	ret = filemap_write_and_wait_range(inode->i_mapping, 0, LLONG_MAX);
 	if (ret)
 		goto out;
-
+	/* 5. 压缩块计数为 0 → 无数据可解压，直接成功 */
 	if (!atomic_read(&fi->i_compr_blocks))
 		goto out;
-
+	/* 6. 计算文件有多少个压缩簇（向上取整）*/
 	last_idx = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
 	last_idx >>= fi->i_log_cluster_size;
-
+	/* 7. 逐簇解压：把压缩簇读出来、解压、写回、再标脏 */
 	for (cluster_idx = 0; cluster_idx < last_idx; cluster_idx++) {
 		page_idx = cluster_idx << fi->i_log_cluster_size;
-
+		/* 7a. 只有被压缩的簇才需要处理 */
 		if (!f2fs_is_compressed_cluster(inode, page_idx))
 			continue;
-
+		/* 7b. 把该簇所有子页重新标脏，触发后续“解压写回”路径 */
 		ret = redirty_blocks(inode, page_idx, fi->i_cluster_size);
 		if (ret < 0)
 			break;
-
+		/* 7c. 脏页过多时主动刷盘，避免内存爆炸 */
 		if (get_dirty_pages(inode) >= BLKS_PER_SEG(sbi)) {
 			ret = filemap_fdatawrite(inode->i_mapping);
 			if (ret < 0)
 				break;
 		}
 
-		cond_resched();
-		if (fatal_signal_pending(current)) {
+		cond_resched();	/* 让出 CPU，避免软锁死 */
+		if (fatal_signal_pending(current)) {	/* 收到致命信号立即退出 */
 			ret = -EINTR;
 			break;
 		}
 	}
-
+	/* 8. 全部标脏后，再一次性刷盘，确保所有簇完成解压落盘 */
 	if (!ret)
 		ret = filemap_write_and_wait_range(inode->i_mapping, 0,
 							LLONG_MAX);
-
+	/* 9. 若中途失败，提醒用户文件可能处于“部分解压”状态，建议删除 */
 	if (ret)
 		f2fs_warn(sbi, "%s: The file might be partially decompressed (errno=%d). Please delete the file.",
 			  __func__, ret);
-	f2fs_update_time(sbi, REQ_TIME);
+	f2fs_update_time(sbi, REQ_TIME);	/* 更新耗时统计 */
 out:
 	inode_unlock(inode);
 	mnt_drop_write_file(filp);
@@ -4504,86 +4581,118 @@ out:
 	return ret;
 }
 
+// 对一个已支持压缩的普通文件，触发“整文件压缩”。
+// F2FS 的 compress ioctl 是通过“强制重写所有 cluster”，让普通 data block 在写回时被压缩写入。
 static int f2fs_ioc_compress_file(struct file *filp)
 {
-	struct inode *inode = file_inode(filp);
+	struct inode *inode = file_inode(filp);	// 从 file 结构取得 inode。
+	// 获取 F2FS 的 superblock 私有信息，用于访问全局状态（segment、GC、选项等）。
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+	// 获取 F2FS inode 私有结构，包含压缩相关字段
 	struct f2fs_inode_info *fi = F2FS_I(inode);
+	// cluster 编号\cluster 起始 page index\cluster 总数
 	pgoff_t page_idx = 0, last_idx, cluster_idx;
 	int ret;
 
+	// 文件系统是否启用压缩
 	if (!f2fs_sb_has_compression(sbi) ||
+			// 是否是用户态可控压缩模式
 			F2FS_OPTION(sbi).compress_mode != COMPR_MODE_USER)
-		return -EOPNOTSUPP;
+		return -EOPNOTSUPP;	// 否则直接拒绝。
 
+	// 压缩会重写文件数据，必须有写权限。
 	if (!(filp->f_mode & FMODE_WRITE))
 		return -EBADF;
 
+	// 在执行大量 block 迁移前：尝试回收空间、平衡 segment 使用情况
+	// 避免后续 writeback 因空间不足失败。
 	f2fs_balance_fs(sbi, true);
 
+	// 通知 VFS：开始一个写操作序列，防止并发只读 remount。
 	ret = mnt_want_write_file(filp);
 	if (ret)
 		return ret;
-	inode_lock(inode);
+	inode_lock(inode);	// 串行化 inode 操作，防止并发写入 / truncate / fsync。
 
+	// 确认压缩算法后端（如 lzo、lz4）可用。
 	if (!f2fs_is_compress_backend_ready(inode)) {
 		ret = -EOPNOTSUPP;
 		goto out;
 	}
 
+	// 语义校验：
+	// inode 必须是“可压缩文件”
+	// 且没有被标记为永久释放压缩能力
 	if (!f2fs_compressed_file(inode) ||
 		is_inode_flag_set(inode, FI_COMPRESS_RELEASED)) {
 		ret = -EINVAL;
 		goto out;
 	}
 
+	// 关键同步点：等待所有已有 dirty page 写回，保证后续压缩操作在“干净状态”下进行
 	ret = filemap_write_and_wait_range(inode->i_mapping, 0, LLONG_MAX);
 	if (ret)
 		goto out;
 
+	// 最关键的一行：在本 ioctl 生命周期内，允许 writeback 生成压缩 cluster
 	set_inode_flag(inode, FI_ENABLE_COMPRESS);
 
+	// 计算文件占用的 page 数。
 	last_idx = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
+	// 将 page 数换算为 cluster 数。
 	last_idx >>= fi->i_log_cluster_size;
 
+	// 逐个 cluster 处理。
 	for (cluster_idx = 0; cluster_idx < last_idx; cluster_idx++) {
+		// 计算该 cluster 的起始 page index。
 		page_idx = cluster_idx << fi->i_log_cluster_size;
 
+		// 如果是空洞 cluster：没有数据，跳过（无需压缩、无需重写）
 		if (f2fs_is_sparse_cluster(inode, page_idx))
 			continue;
 
+		// 触发核心动作：将 cluster 覆盖的所有 page：
+		// 拉入 page cache
+		// 等待 writeback
+		// 标记 dirty
+		// 设置 PAGE_PRIVATE_ONGOING_MIGRATION
+		// 强制它们在 writeback 时 重新分配 block
 		ret = redirty_blocks(inode, page_idx, fi->i_cluster_size);
-		if (ret < 0)
+		if (ret < 0)	// redirty 失败直接终止。
 			break;
 
+		// 如果 dirty page 过多（≈ 一个 segment）：主动触发写回，避免内存和 allocator 压力。
 		if (get_dirty_pages(inode) >= BLKS_PER_SEG(sbi)) {
 			ret = filemap_fdatawrite(inode->i_mapping);
-			if (ret < 0)
+			if (ret < 0)	// 写回失败则中止。
 				break;
 		}
 
-		cond_resched();
-		if (fatal_signal_pending(current)) {
+		cond_resched();	// 主动让出 CPU，防止长时间占用调度器。
+		if (fatal_signal_pending(current)) {	// 响应 kill / signal，保证 ioctl 可中断。
 			ret = -EINTR;
 			break;
 		}
-	}
+	}	// cluster 循环结束。
 
+	// 如果前面没有错误： 等待 所有 redirty page 写回完成，确保压缩真正落盘
 	if (!ret)
 		ret = filemap_write_and_wait_range(inode->i_mapping, 0,
 							LLONG_MAX);
 
+	// 非常重要：关闭压缩写回窗口，防止后续普通写入被意外压缩
 	clear_inode_flag(inode, FI_ENABLE_COMPRESS);
-
+	
+	// 如果中途失败： 文件可能处于“部分 cluster 已压缩”的状态，给出明确警告
 	if (ret)
 		f2fs_warn(sbi, "%s: The file might be partially compressed (errno=%d). Please delete the file.",
 			  __func__, ret);
-	f2fs_update_time(sbi, REQ_TIME);
+	f2fs_update_time(sbi, REQ_TIME);	// 更新文件系统的请求时间（统计 / aging 用）。
 out:
-	inode_unlock(inode);
-	mnt_drop_write_file(filp);
+	inode_unlock(inode);	// 释放 inode 锁。
+	mnt_drop_write_file(filp);	// 结束写操作序列。
 
-	return ret;
+	return ret;	// 返回结果。
 }
 
 static long __f2fs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)

@@ -179,6 +179,7 @@ static bool __is_front_mergeable(struct extent_info *cur,
 	return __is_extent_mergeable(cur, front, type);
 }
 
+// 在 rb-tree 里查找覆盖目标页号的 extent 节点
 static struct extent_node *__lookup_extent_node(struct rb_root_cached *root,
 			struct extent_node *cached_en, unsigned int fofs)
 {
@@ -186,22 +187,24 @@ static struct extent_node *__lookup_extent_node(struct rb_root_cached *root,
 	struct extent_node *en;
 
 	/* check a cached entry */
+	/* 1. 先走捷径：看上次缓存的节点是否正好命中 */
 	if (cached_en && cached_en->ei.fofs <= fofs &&
 			cached_en->ei.fofs + cached_en->ei.len > fofs)
-		return cached_en;
+		return cached_en;	/* 命中直接返回 */
 
 	/* check rb_tree */
+	/* 2. 缓存未命中，再进红黑树精确查找 */
 	while (node) {
 		en = rb_entry(node, struct extent_node, rb_node);
 
-		if (fofs < en->ei.fofs)
+		if (fofs < en->ei.fofs)	/* 目标页号太小，往左子树走 */
 			node = node->rb_left;
-		else if (fofs >= en->ei.fofs + en->ei.len)
+		else if (fofs >= en->ei.fofs + en->ei.len)	/* 目标页号太大，往右子树走 */
 			node = node->rb_right;
 		else
-			return en;
+			return en;	/* 落在当前节点范围，找到 */
 	}
-	return NULL;
+	return NULL;	 /* 红黑树里没有能覆盖的节点 */
 }
 
 /*
@@ -477,6 +480,7 @@ void f2fs_init_extent_tree(struct inode *inode)
 		__grab_extent_tree(inode, EX_BLOCK_AGE);
 }
 
+// 在 extent 树里查找连续块
 static bool __lookup_extent_tree(struct inode *inode, pgoff_t pgofs,
 			struct extent_info *ei, enum extent_type type)
 {
@@ -486,48 +490,53 @@ static bool __lookup_extent_tree(struct inode *inode, pgoff_t pgofs,
 	struct extent_node *en;
 	bool ret = false;
 
-	if (!et)
+	if (!et)	/* 这颗树还没长出来 → 直接 miss */
 		return false;
 
 	trace_f2fs_lookup_extent_tree_start(inode, pgofs, type);
 
-	read_lock(&et->lock);
+	read_lock(&et->lock);	/* 读锁保护 */
 
+	/* 读类型捷径：先碰运气看是否落在“最大 extent”里 */
 	if (type == EX_READ &&
 			et->largest.fofs <= pgofs &&
 			(pgoff_t)et->largest.fofs + et->largest.len > pgofs) {
-		*ei = et->largest;
+		*ei = et->largest;	/* 命中最大块，直接复制 */
 		ret = true;
 		stat_inc_largest_node_hit(sbi);
 		goto out;
 	}
 
-	if (IS_DEVICE_ALIASING(inode)) {
+	if (IS_DEVICE_ALIASING(inode)) {	/* 设备别名 inode 不缓存 */
 		ret = false;
 		goto out;
 	}
 
+	/* 红黑树里精确查找 */
 	en = __lookup_extent_node(&et->root, et->cached_en, pgofs);
-	if (!en)
+	if (!en)	/* 没找到节点 */
 		goto out;
 
+	/* 命中最近使用节点 */
 	if (en == et->cached_en)
 		stat_inc_cached_node_hit(sbi, type);
 	else
 		stat_inc_rbtree_node_hit(sbi, type);
 
-	*ei = en->ei;
+	*ei = en->ei;	/* 把找到的 extent 返回给调用者 */
 	spin_lock(&eti->extent_lock);
+	/* 把节点移到 LRU 尾部，更新 cached 指针 */
 	if (!list_empty(&en->list)) {
 		list_move_tail(&en->list, &eti->extent_list);
 		et->cached_en = en;
 	}
 	spin_unlock(&eti->extent_lock);
-	ret = true;
+	ret = true;	// 返回true表示找到了
 out:
 	stat_inc_total_hit(sbi, type);
 	read_unlock(&et->lock);
 
+	/* trace 出口 */
 	if (type == EX_READ)
 		trace_f2fs_lookup_read_extent_tree_end(inode, pgofs, ei);
 	else if (type == EX_BLOCK_AGE)
@@ -1030,12 +1039,14 @@ out:
 }
 
 /* read extent cache operations */
+// 读 extent cache 查询
 bool f2fs_lookup_read_extent_cache(struct inode *inode, pgoff_t pgofs,
 				struct extent_info *ei)
 {
-	if (!__may_extent_tree(inode, EX_READ))
+	if (!__may_extent_tree(inode, EX_READ))	/* 文件/挂载点未开启读 cache 直接失败 */
 		return false;
 
+	/* 在 radix 树里找连续块 */
 	return __lookup_extent_tree(inode, pgofs, ei, EX_READ);
 }
 

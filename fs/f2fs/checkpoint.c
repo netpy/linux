@@ -54,62 +54,76 @@ repeat:
 	return folio;
 }
 
+// 把指定 index 的 meta 页抓到内存并读盘
+/*
+ * 根据 meta 区页号 index，抓取对应的 meta folio，
+ * 默认加锁并等待 I/O 完成，返回 uptodate 的 folio。
+ * is_meta=true 表示正常 meta 页；false 表示 POR（前滚恢复）阶段。
+ */
 static struct folio *__get_meta_folio(struct f2fs_sb_info *sbi, pgoff_t index,
 							bool is_meta)
 {
-	struct address_space *mapping = META_MAPPING(sbi);
+	struct address_space *mapping = META_MAPPING(sbi);	/* meta 映射树 */
 	struct folio *folio;
+	/* 构造 meta 读 I/O 控制块 */
 	struct f2fs_io_info fio = {
 		.sbi = sbi,
-		.type = META,
-		.op = REQ_OP_READ,
-		.op_flags = REQ_META | REQ_PRIO,
-		.old_blkaddr = index,
+		.type = META,	/* I/O 类型：meta */
+		.op = REQ_OP_READ,	/* 读操作 */
+		.op_flags = REQ_META | REQ_PRIO,	/* meta 优先读 */
+		.old_blkaddr = index,	/* 物理块号 = 索引（meta 区线性映射）*/
 		.new_blkaddr = index,
 		.encrypted_page = NULL,
-		.is_por = !is_meta ? 1 : 0,
+		.is_por = !is_meta ? 1 : 0,	/* POR 阶段去掉 REQ_META 标志*/
 	};
 	int err;
 
-	if (unlikely(!is_meta))
+	if (unlikely(!is_meta))	/* POR 阶段：去掉 REQ_META 标志*/
 		fio.op_flags &= ~REQ_META;
 repeat:
+	/* 1. 抓取 meta folio（不锁）*/
 	folio = f2fs_grab_cache_folio(mapping, index, false);
 	if (IS_ERR(folio)) {
-		cond_resched();
+		cond_resched();	/* 让出 CPU，避免死循环*/
 		goto repeat;
 	}
 	if (folio_test_uptodate(folio))
-		goto out;
+		goto out;	/* 已是 uptodate → 直接返回*/
 
+	/* 2. 构造并提交读 BIO（META 优先）*/
 	fio.page = &folio->page;
 
 	err = f2fs_submit_page_bio(&fio);
 	if (err) {
-		f2fs_folio_put(folio, true);
+		f2fs_folio_put(folio, true);	/* 提交失败 → 解锁并返回错误*/
 		return ERR_PTR(err);
 	}
 
+	/* 3. 统计：meta 读 I/O 计数*/
 	f2fs_update_iostat(sbi, NULL, FS_META_READ_IO, F2FS_BLKSIZE);
 
+	/* 4. 加页锁并等待 I/O 完成*/
 	folio_lock(folio);
-	if (unlikely(!is_meta_folio(folio))) {
+	if (unlikely(!is_meta_folio(folio))) {	/* 完整性检查：必须是 meta 页*/
 		f2fs_folio_put(folio, true);
-		goto repeat;
+		goto repeat;	/* 不是 meta 页 → 重试*/
 	}
 
+	/* I/O 失败 → 处理 EIO*/
 	if (unlikely(!folio_test_uptodate(folio))) {
 		f2fs_handle_page_eio(sbi, folio, META);
 		f2fs_folio_put(folio, true);
 		return ERR_PTR(-EIO);
 	}
 out:
-	return folio;
+	return folio;	/* 返回锁定的 uptodate folio*/
 }
 
+// 抓取一个 meta 页（NAT/SIT/SSA/Node）:根据索引 index，返回对应的 meta folio，默认加锁并等待 I/O 完成。
+// 根据 meta 区页号，返回加锁且已读盘的 folio，用于读/写 NAT/SIT/SSA/Node。
 struct folio *f2fs_get_meta_folio(struct f2fs_sb_info *sbi, pgoff_t index)
 {
-	return __get_meta_folio(sbi, index, true);
+	return __get_meta_folio(sbi, index, true);	/* true = 加锁 + 等待 uptodate */
 }
 
 struct folio *f2fs_get_meta_folio_retry(struct f2fs_sb_info *sbi, pgoff_t index)

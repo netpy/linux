@@ -106,17 +106,24 @@ enum bio_post_read_step {
 #endif
 };
 
+// bio 读完后要“后处理”哪些步骤、状态如何，全装在这个小结构里。
+// 读 I/O 完成 → 如果 enabled_steps 非零 或 文件被压缩，
+// 就分配 bio_post_read_ctx，把后续“解密→解压→校验”串成 work，依次在 post_read_wq 里执行；
+// 其中解压步骤以 簇 为单位，用 fs_blkaddr 定位，用 decompression_attempted 保证每簇只解压一次。
 struct bio_post_read_ctx {
-	struct bio *bio;
-	struct f2fs_sb_info *sbi;
-	struct work_struct work;
+	struct bio *bio;	// 本次需要后续处理的 bio（读刚刚完成）
+	struct f2fs_sb_info *sbi;	// 所属超级块信息，方便拿 workqueue、错误统计等
+	struct work_struct work;	// 若步骤不能立即执行，挂到 post_read_wq 的 work 节点
+	// 位图，记录要跑的后续步骤：STEP_DECRYPT、STEP_DECOMPRESS、STEP_VERITY
 	unsigned int enabled_steps;
 	/*
 	 * decompression_attempted keeps track of whether
 	 * f2fs_end_read_compressed_page() has been called on the pages in the
 	 * bio that belong to a compressed cluster yet.
 	 */
+	// 已尝试解压标志：防止对同一簇多次调用解压流程
 	bool decompression_attempted;
+	// bio 起始文件系统块号，用于定位压缩簇、verity 范围
 	block_t fs_blkaddr;
 };
 
@@ -134,29 +141,34 @@ struct bio_post_read_ctx {
  * called (i.e., I/O error or decryption error, but *not* verity error), and
  * release the bio's reference to the decompress_io_ctx of the page's cluster.
  */
+// bio 读完成后的通用收尾
+// 压缩页补失败通知并 put_dic，普通页直接 end_read，最后归还 ctx 并 bio_put。
 static void f2fs_finish_read_bio(struct bio *bio, bool in_task)
 {
 	struct folio_iter fi;
 	struct bio_post_read_ctx *ctx = bio->bi_private;
 
+	/* 遍历 bio 内的每一个 folio（页） */
 	bio_for_each_folio_all(fi, bio) {
 		struct folio *folio = fi.folio;
-
+		/* 1. 压缩页特殊处理： */
 		if (f2fs_is_compressed_page(&folio->page)) {
+			/* 1a. 如果之前没走解压流程（I/O 或解密失败），这里补一次“失败”通知 */
 			if (ctx && !ctx->decompression_attempted)
 				f2fs_end_read_compressed_page(&folio->page, true, 0,
 							in_task);
+			/* 1b. 释放本 bio 对 dic 的引用（引用归零时才会真正释放 dic）*/
 			f2fs_put_folio_dic(folio, in_task);
 			continue;
 		}
-
+		/* 2. 普通页：更新读计数，按 bi_status 标记 uptodate 并解锁 */
 		dec_page_count(F2FS_F_SB(folio), __read_io_type(folio));
 		folio_end_read(folio, bio->bi_status == BLK_STS_OK);
 	}
-
+	/* 3. 如果存在 post-read 上下文，归还到 mempool */
 	if (ctx)
 		mempool_free(ctx, bio_post_read_ctx_pool);
-	bio_put(bio);
+	bio_put(bio);	/* 4. 释放 bio 本身 */
 }
 
 static void f2fs_verify_bio(struct work_struct *work)
@@ -209,14 +221,20 @@ static void f2fs_verify_bio(struct work_struct *work)
  * can involve reading verity metadata pages from the file, and these verity
  * metadata pages may be encrypted and/or compressed.
  */
+// bio 读后最后一道关卡：要么排队 verity，要么立即收工
+/*
+ * 若 bio 还需 fs-verity 校验，则把校验工作扔到独立 workqueue；
+ * 否则立即完成 bio。
+ */
 static void f2fs_verify_and_finish_bio(struct bio *bio, bool in_task)
 {
 	struct bio_post_read_ctx *ctx = bio->bi_private;
-
+	/* 1. 需要 verity → 转到 fsverity 全局工作队列，避免与解密/解压 workqueue 死锁 */
 	if (ctx && (ctx->enabled_steps & STEP_VERITY)) {
 		INIT_WORK(&ctx->work, f2fs_verify_bio);
 		fsverity_enqueue_verify_work(&ctx->work);
 	} else {
+		/* 2. 无需 verity，立即收尾：解锁页、标记 uptodate、释放 bio 和 ctx */
 		f2fs_finish_read_bio(bio, in_task);
 	}
 }
@@ -230,71 +248,90 @@ static void f2fs_verify_and_finish_bio(struct bio *bio, bool in_task)
  * that the bio includes at least one compressed page.  The actual decompression
  * is done on a per-cluster basis, not a per-bio basis.
  */
+// 按簇粒度把 bio 里的压缩页一次性丢给解压引擎
+// 遍历 bio 逐页丢给解压引擎；全压缩就省掉 bio 级 verity，簇级已搞定。
+/*
+ * 处理 STEP_DECOMPRESS：把 bio 中属于压缩簇的那些页一次性交给解压引擎，
+ * 并按簇粒度完成后续 verity 标记优化。
+ */
 static void f2fs_handle_step_decompress(struct bio_post_read_ctx *ctx,
 		bool in_task)
 {
 	struct bio_vec *bv;
-	struct bvec_iter_all iter_all;
-	bool all_compressed = true;
-	block_t blkaddr = ctx->fs_blkaddr;
+	struct bvec_iter_all iter_all;	/* 遍历 bio 所有 segment 的迭代器 */
+	bool all_compressed = true;	/* 假设 bio 内全是压缩页 */
+	block_t blkaddr = ctx->fs_blkaddr;	/* 起始块号，用于定位簇 */
 
+	/* 1. 遍历 bio 每一页 */
 	bio_for_each_segment_all(bv, ctx->bio, iter_all) {
 		struct page *page = bv->bv_page;
-
+		/* 1a. 若是压缩页 → 交给压缩页结束函数，触发按簇解压 */
+		// 需要注意的是，只有遍历到整个簇的最后一页，才会触发解压
 		if (f2fs_is_compressed_page(page))
 			f2fs_end_read_compressed_page(page, false, blkaddr,
 						      in_task);
 		else
-			all_compressed = false;
+			all_compressed = false;	/* 只要出现非压缩页就置标志 */
 
-		blkaddr++;
+		blkaddr++;	/* 块号递增，对应下一页 */
 	}
 
-	ctx->decompression_attempted = true;
+	ctx->decompression_attempted = true;	/* 标记已尝试过解压 */
 
 	/*
 	 * Optimization: if all the bio's pages are compressed, then scheduling
 	 * the per-bio verity work is unnecessary, as verity will be fully
 	 * handled at the compression cluster level.
 	 */
+	/* 2. 优化：若 bio 内全是压缩页，则 verity 已在簇层完成，
+	 *    无需再为整个 bio 排队 STEP_VERITY，直接清掉该位
+	 */
 	if (all_compressed)
 		ctx->enabled_steps &= ~STEP_VERITY;
 }
 
+// bio 后续处理 work 函数
+// 先解密，再解压，最后 verity 收工——三步串行完成 bio 读后处理。
 static void f2fs_post_read_work(struct work_struct *work)
 {
 	struct bio_post_read_ctx *ctx =
 		container_of(work, struct bio_post_read_ctx, work);
 	struct bio *bio = ctx->bio;
-
+	/* 1. 需要解密且解密失败 → 直接收尾（页已解锁，错误标记已置） */
 	if ((ctx->enabled_steps & STEP_DECRYPT) && !fscrypt_decrypt_bio(bio)) {
 		f2fs_finish_read_bio(bio, true);
 		return;
 	}
-
+	/* 2. 需要解压 → 把 bio 内所有压缩页按簇粒度交给解压引擎（进程上下文） */
 	if (ctx->enabled_steps & STEP_DECOMPRESS)
 		f2fs_handle_step_decompress(ctx, true);
-
+	/* 3. 最后统一做 verity 标记并释放 bio 和 ctx（进程上下文安全） */
 	f2fs_verify_and_finish_bio(bio, true);
 }
 
+// 读 bio 结束后的分叉处理
+// 失败直接收尾；仅解压且内存足→当场解压；其余扔 workqueue；没事做就 verity 收工。
 static void f2fs_read_end_io(struct bio *bio)
 {
 	struct f2fs_sb_info *sbi = F2FS_P_SB(bio_first_page_all(bio));
 	struct bio_post_read_ctx *ctx;
 	bool intask = in_task();
-
+	/* 1. 解绑并更新读统计 */
 	iostat_update_and_unbind_ctx(bio);
-	ctx = bio->bi_private;
+	ctx = bio->bi_private;	/* 取出之前绑定的“后续动作”上下文 */
 
+	/* 2. 注入错误 or 真实 I/O 失败 → 直接收尾 */
 	if (time_to_inject(sbi, FAULT_READ_IO))
 		bio->bi_status = BLK_STS_IOERR;
 
-	if (bio->bi_status != BLK_STS_OK) {
+	// I/O 一旦失败，马上解锁所有页并退出，后续解密/解压等步骤全部省掉。
+	// bi_status ≠ BLK_STS_OK → 底层 I/O 失败（磁盘错误、超时、DM 映射失败等）。
+	if (bio->bi_status != BLK_STS_OK) {	// 立即调用 f2fs_finish_read_bio() 做最小必要清理：
 		f2fs_finish_read_bio(bio, intask);
 		return;
 	}
 
+	/* 3. 有需要“延后处理”的步骤（解密/解压） */
 	if (ctx) {
 		unsigned int enabled_steps = ctx->enabled_steps &
 					(STEP_DECRYPT | STEP_DECOMPRESS);
@@ -303,34 +340,38 @@ static void f2fs_read_end_io(struct bio *bio)
 		 * If we have only decompression step between decompression and
 		 * decrypt, we don't need post processing for this.
 		 */
+		/* 3a. 仅解压且非低内存 → 立即在当前上下文做完，省一次 workqueue */
 		if (enabled_steps == STEP_DECOMPRESS &&
 				!f2fs_low_mem_mode(sbi)) {
 			f2fs_handle_step_decompress(ctx, intask);
 		} else if (enabled_steps) {
+			/* 3b. 其余情况（含解密或多步骤）扔给 post_read_wq 串行处理 */
 			INIT_WORK(&ctx->work, f2fs_post_read_work);
 			queue_work(ctx->sbi->post_read_wq, &ctx->work);
 			return;
 		}
 	}
-
+	/* 4. 没有任何后续步骤 → 直接做 verity 标记并结束 bio */
 	f2fs_verify_and_finish_bio(bio, intask);
 }
 
+// F2FS 写 BIO 完成后的统一收尾
+// 解密换页→压缩走专用路径→普通页按类型计数/出错停 CP→清标记唤醒
 static void f2fs_write_end_io(struct bio *bio)
 {
 	struct f2fs_sb_info *sbi;
 	struct folio_iter fi;
-
+	/* 1. 解绑并更新写统计（带宽、延迟）*/
 	iostat_update_and_unbind_ctx(bio);
-	sbi = bio->bi_private;
-
+	sbi = bio->bi_private;	/* 在提交时绑定的 sbi */
+	/* 2. 故障注入测试点 */
 	if (time_to_inject(sbi, FAULT_WRITE_IO))
 		bio->bi_status = BLK_STS_IOERR;
-
+	/* 3. 遍历 bio 内每一页 */
 	bio_for_each_folio_all(fi, bio) {
 		struct folio *folio = fi.folio;
 		enum count_type type;
-
+		/* 3a. 若是加密 bounce 页，先换回真正的 pagecache 页并释放 bounce */
 		if (fscrypt_is_bounce_folio(folio)) {
 			struct folio *io_folio = folio;
 
@@ -339,35 +380,37 @@ static void f2fs_write_end_io(struct bio *bio)
 		}
 
 #ifdef CONFIG_F2FS_FS_COMPRESSION
+		/* 3b. 压缩子页 → 走专用压缩写回收尾（解压、拷贝、解锁）*/
 		if (f2fs_is_compressed_page(&folio->page)) {
 			f2fs_compress_write_end_io(bio, &folio->page);
 			continue;
 		}
 #endif
-
+		/* 3c. 普通数据/节点页 → 按类型计数 */
 		type = WB_DATA_TYPE(&folio->page, false);
-
+		/* 3d. I/O 失败 → 标记 mapping 错误，若属 CP 数据则停 checkpoint */
 		if (unlikely(bio->bi_status != BLK_STS_OK)) {
 			mapping_set_error(folio->mapping, -EIO);
 			if (type == F2FS_WB_CP_DATA)
 				f2fs_stop_checkpoint(sbi, true,
 						STOP_CP_REASON_WRITE_FAIL);
 		}
-
+		/* 3e. 一致性检查：node 页 index 必须等于 nid */
 		f2fs_bug_on(sbi, is_node_folio(folio) &&
 				folio->index != nid_of_node(&folio->page));
-
+		/* 3f. 更新写计数、清 GC-in-flight 标记、结束 writeback 并唤醒等待者 */
 		dec_page_count(sbi, type);
 		if (f2fs_in_warm_node_list(sbi, folio))
 			f2fs_del_fsync_node_entry(sbi, folio);
 		clear_page_private_gcing(&folio->page);
 		folio_end_writeback(folio);
 	}
+	/* 4. 若所有 CP 数据写完成且有线程在等待，唤醒 checkpoint 等待队列 */
 	if (!get_pages(sbi, F2FS_WB_CP_DATA) &&
 				wq_has_sleeper(&sbi->cp_wait))
 		wake_up(&sbi->cp_wait);
 
-	bio_put(bio);
+	bio_put(bio);	/* 释放 bio 本身 */
 }
 
 #ifdef CONFIG_BLK_DEV_ZONED
@@ -509,22 +552,40 @@ static bool f2fs_crypt_mergeable_bio(struct bio *bio, const struct inode *inode,
 	return fscrypt_mergeable_bio(bio, inode, next_idx);
 }
 
+// 读 BIO 提交到块层
+/*
+ * 将读 BIO 提交到块层（无额外封装，仅 trace + 统计 + submit_bio）。
+ * 调用前必须保证 BIO 操作码是 READ/READA。
+ */
 void f2fs_submit_read_bio(struct f2fs_sb_info *sbi, struct bio *bio,
 				 enum page_type type)
 {
+	/* 1. 断言：必须是读操作（编译期警告）*/
 	WARN_ON_ONCE(!is_read_io(bio_op(bio)));
+	/* 2. trace 点：记录读 BIO 提交（调试用）*/
 	trace_f2fs_submit_read_bio(sbi->sb, type, bio);
 
+	/* 3. 统计：更新对应类型（META/NODE/DATA）的读 I/O 计数*/
 	iostat_update_submit_ctx(bio, type);
+	/* 4. 最终提交：把 BIO 交给块层调度*/
 	submit_bio(bio);
 }
 
+// 把写 BIO 提交到块层
+/*
+ * 将写 BIO 提交到块层（无额外封装，仅 trace + 统计 + submit_bio）。
+ * 调用前必须保证 BIO 操作码是 WRITE/WRITE_ZEROES 等。
+ */
 static void f2fs_submit_write_bio(struct f2fs_sb_info *sbi, struct bio *bio,
 				  enum page_type type)
 {
+	/* 1. 断言：必须是写操作（编译期警告）*/
 	WARN_ON_ONCE(is_read_io(bio_op(bio)));
+	/* 2. trace 点：记录写 BIO 提交（调试用）*/
 	trace_f2fs_submit_write_bio(sbi->sb, type, bio);
+	/* 3. 统计：更新对应类型（META/NODE/DATA）的写 I/O 计数*/
 	iostat_update_submit_ctx(bio, type);
+	/* 4. 最终提交：把 BIO 交给块层调度*/
 	submit_bio(bio);
 }
 
@@ -688,38 +749,51 @@ void f2fs_flush_merged_writes(struct f2fs_sb_info *sbi)
  * Fill the locked page with data located in the block address.
  * A caller needs to unlock the page on failure.
  */
+// 把一页数据通过 BIO 提交到磁盘（读或写）:“校验地址 → 分配 BIO → 加页/加密 → 统计 → 提交读/写 → 返回 0。”
+/*
+ * 将锁定页的数据提交到指定磁盘块地址（读或写）。
+ * 调用者负责在失败时解锁页。
+ */
 int f2fs_submit_page_bio(struct f2fs_io_info *fio)
 {
 	struct bio *bio;
-	struct folio *fio_folio = page_folio(fio->page);
-	struct folio *data_folio = fio->encrypted_page ?
+	struct folio *fio_folio = page_folio(fio->page);	/* 原始页 folio */
+	struct folio *data_folio = fio->encrypted_page ?	/* 加密页或原始页 */
 			page_folio(fio->encrypted_page) : fio_folio;
 
+	/* 1. 校验目标块地址是否合法（POR/META/DATA 不同范围）*/
 	if (!f2fs_is_valid_blkaddr(fio->sbi, fio->new_blkaddr,
 			fio->is_por ? META_POR : (__is_meta_io(fio) ?
 			META_GENERIC : DATA_GENERIC_ENHANCE)))
-		return -EFSCORRUPTED;
+		return -EFSCORRUPTED;	/* 地址非法 → 返回损坏错误*/
 
+	/* 2. trace 点：记录本次 I/O（调试用）*/
 	trace_f2fs_submit_folio_bio(data_folio, fio);
 
 	/* Allocate a new bio */
+	/* 3. 分配单页 BIO（1 个 segment）*/
 	bio = __bio_alloc(fio, 1);
-
+	
+	/* 4. 设置 BIO 加密上下文（fscrypt）*/
 	f2fs_set_bio_crypt_ctx(bio, fio_folio->mapping->host,
 			fio_folio->index, fio, GFP_NOIO);
+	/* 5. 把 folio 加入 BIO（失败则内部 panic）*/
 	bio_add_folio_nofail(bio, data_folio, folio_size(data_folio), 0);
-
+	
+	/* 6. 若带 wbc 且是写 → 统计 cgroup 写回量*/
 	if (fio->io_wbc && !is_read_io(fio->op))
 		wbc_account_cgroup_owner(fio->io_wbc, fio_folio, PAGE_SIZE);
 
+	/* 7. 统计：读/写类型计数*/
 	inc_page_count(fio->sbi, is_read_io(fio->op) ?
 			__read_io_type(data_folio) : WB_DATA_TYPE(fio->page, false));
-
+	
+	/* 8. 提交 BIO：读走 read_bio，写走 write_bio*/
 	if (is_read_io(bio_op(bio)))
 		f2fs_submit_read_bio(fio->sbi, bio, fio->type);
 	else
 		f2fs_submit_write_bio(fio->sbi, bio, fio->type);
-	return 0;
+	return 0;	/* 成功提交 → 返回 0 */
 }
 
 static bool page_is_mergeable(struct f2fs_sb_info *sbi, struct bio *bio,
@@ -1039,29 +1113,34 @@ out:
 	f2fs_up_write(&io->io_rwsem);
 }
 
+// 为读请求预先分配并初始化 bio 及其后续处理上下文
+// 先分配 bio，再按加密/校验/压缩需求打包后续步骤上下文，最后绑统计——四步拿到‘带售后’的读 bio。
 static struct bio *f2fs_grab_read_bio(struct inode *inode, block_t blkaddr,
 				      unsigned nr_pages, blk_opf_t op_flag,
 				      pgoff_t first_idx, bool for_write)
 {
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct bio *bio;
-	struct bio_post_read_ctx *ctx = NULL;
-	unsigned int post_read_steps = 0;
-	sector_t sector;
+	struct bio_post_read_ctx *ctx = NULL;	/* bio 结束后要执行的“后续动作”上下文 */
+	unsigned int post_read_steps = 0;	/* 位图：有哪些后续步骤需要执行 */
+	sector_t sector;	/* 目标扇区号 */
 	struct block_device *bdev = f2fs_target_device(sbi, blkaddr, &sector);
-
+	/* 1. 分配 bio，一次性可承载 nr_pages 页，使用 f2fs 私有 bio_set */
 	bio = bio_alloc_bioset(bdev, bio_max_segs(nr_pages),
 			       REQ_OP_READ | op_flag,
 			       for_write ? GFP_NOIO : GFP_KERNEL, &f2fs_bioset);
-	bio->bi_iter.bi_sector = sector;
-	f2fs_set_bio_crypt_ctx(bio, inode, first_idx, NULL, GFP_NOFS);
-	bio->bi_end_io = f2fs_read_end_io;
+	bio->bi_iter.bi_sector = sector;	/* 设置起始扇区 */
 
+	/* 2. 设置加密上下文（若文件启用 fscrypt） */
+	f2fs_set_bio_crypt_ctx(bio, inode, first_idx, NULL, GFP_NOFS);
+	/* 3. 注册通用结束回调（负责解锁页、清 uptodate、统计等） */
+	bio->bi_end_io = f2fs_read_end_io;
+	/* 4. 根据文件属性，把需要“延后处理”的步骤写进位图 */
 	if (fscrypt_inode_uses_fs_layer_crypto(inode))
-		post_read_steps |= STEP_DECRYPT;
+		post_read_steps |= STEP_DECRYPT;	/* 需要解密 */
 
 	if (f2fs_need_verity(inode, first_idx))
-		post_read_steps |= STEP_VERITY;
+		post_read_steps |= STEP_VERITY;	/* 需要 fs-verity 校验 */
 
 	/*
 	 * STEP_DECOMPRESS is handled specially, since a compressed file might
@@ -1069,20 +1148,26 @@ static struct bio *f2fs_grab_read_bio(struct inode *inode, block_t blkaddr,
 	 * bio_post_read_ctx if the file is compressed, but the caller is
 	 * responsible for enabling STEP_DECOMPRESS if it's actually needed.
 	 */
-
+	/*
+	 * STEP_DECOMPRESS 特殊处理：文件可能同时存在压缩/非压缩簇，
+	 * 这里只要文件开了压缩就预先分配 ctx，但是否真的解压由调用方
+	 * 在提交 bio 前再把 STEP_DECOMPRESS 加进 enabled_steps。
+	 */
+	/* 5. 只要后续有任何步骤，或者文件可能被压缩，就分配 ctx（ mempool 保证不失败） */
 	if (post_read_steps || f2fs_compressed_file(inode)) {
 		/* Due to the mempool, this never fails. */
 		ctx = mempool_alloc(bio_post_read_ctx_pool, GFP_NOFS);
 		ctx->bio = bio;
 		ctx->sbi = sbi;
-		ctx->enabled_steps = post_read_steps;
-		ctx->fs_blkaddr = blkaddr;
-		ctx->decompression_attempted = false;
-		bio->bi_private = ctx;
+		ctx->enabled_steps = post_read_steps;	/* 当前仅解密/校验，解压位稍后追加 */
+		ctx->fs_blkaddr = blkaddr;	/* 用于定位压缩簇 */
+		ctx->decompression_attempted = false;	/* 尚未尝试解压 */
+		bio->bi_private = ctx;	/* 绑定到 bio->bi_private */
 	}
+	/* 6. 把 bio 与 iostat 上下文绑定，用于统计带宽/延迟 */
 	iostat_alloc_and_bind_ctx(sbi, bio, ctx);
 
-	return bio;
+	return bio;	/* 调用方继续填充 bio_vec 后提交 */
 }
 
 /* This can handle encryption stuffs */
@@ -1114,11 +1199,13 @@ static int f2fs_submit_page_read(struct inode *inode, struct folio *folio,
 	return 0;
 }
 
+// 真正把新块号塞进节点页
 static void __set_data_blkaddr(struct dnode_of_data *dn, block_t blkaddr)
 {
-	__le32 *addr = get_dnode_addr(dn->inode, dn->node_folio);
+	__le32 *addr = get_dnode_addr(dn->inode, dn->node_folio);	/* 拿到节点页里块号数组首地址 */
 
-	dn->data_blkaddr = blkaddr;
+	dn->data_blkaddr = blkaddr;	/* 先更新内存副本 */
+	/* 再写回小端格式到对应槽位 */
 	addr[dn->ofs_in_node] = cpu_to_le32(dn->data_blkaddr);
 }
 
@@ -1128,18 +1215,21 @@ static void __set_data_blkaddr(struct dnode_of_data *dn, block_t blkaddr)
  *  ->node_folio
  *    update block addresses in the node page
  */
+// 安全地修改数据块地址:等写回 → 改地址 → 标脏记账，锁序保安全。
 void f2fs_set_data_blkaddr(struct dnode_of_data *dn, block_t blkaddr)
 {
+	/* 等 node_folio 写回完成，避免并发改写 */
 	f2fs_folio_wait_writeback(dn->node_folio, NODE, true, true);
-	__set_data_blkaddr(dn, blkaddr);
-	if (folio_mark_dirty(dn->node_folio))
+	__set_data_blkaddr(dn, blkaddr);	/* 真正把新块号写进节点页 */
+	if (folio_mark_dirty(dn->node_folio))	/* 把节点页标脏；若成功置脏，记录“节点已变更” */
 		dn->node_changed = true;
 }
 
+// 更新数据块地址并同步读缓存
 void f2fs_update_data_blkaddr(struct dnode_of_data *dn, block_t blkaddr)
 {
-	f2fs_set_data_blkaddr(dn, blkaddr);
-	f2fs_update_read_extent_cache(dn);
+	f2fs_set_data_blkaddr(dn, blkaddr);	/* 把新块号写进物理索引节点 */
+	f2fs_update_read_extent_cache(dn);	/* 同步刷新读范围缓存，保证后续读命中 */
 }
 
 /* dn->ofs_in_node will be returned with up-to-date last block pointer */
@@ -2174,169 +2264,190 @@ out:
 }
 
 #ifdef CONFIG_F2FS_FS_COMPRESSION
+/*
+ * F2FS 解压缩读核心函数：
+ * 把 16 个压缩块从磁盘读进来 → 解压缩 → 返回原始 16 页
+ */
 int f2fs_read_multi_pages(struct compress_ctx *cc, struct bio **bio_ret,
 				unsigned nr_pages, sector_t *last_block_in_bio,
 				struct readahead_control *rac, bool for_write)
 {
-	struct dnode_of_data dn;
+	struct dnode_of_data dn;	/* 用于从 node 块取地址 */
 	struct inode *inode = cc->inode;
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
-	struct bio *bio = *bio_ret;
+	struct bio *bio = *bio_ret;	/* 传入的 bio 链，可继续追加 */
+	/* 16 页对齐窗口起始页号 */
 	unsigned int start_idx = cc->cluster_idx << cc->log_cluster_size;
-	sector_t last_block_in_file;
-	const unsigned int blocksize = F2FS_BLKSIZE;
-	struct decompress_io_ctx *dic = NULL;
-	struct extent_info ei = {};
-	bool from_dnode = true;
+	sector_t last_block_in_file;	 /* 文件最后一个块号（EOF 边界）*/
+	const unsigned int blocksize = F2FS_BLKSIZE;	/* 4 KiB */
+	struct decompress_io_ctx *dic = NULL;	/* 解压缩上下文（异步解压用）*/
+	struct extent_info ei = {};	/* 读 extent cache 结果 */
+	bool from_dnode = true;	/* true=从 node 块读地址，false=用 extent cache */
 	int i;
 	int ret = 0;
-
+	/* 1. 熔断：checkpoint 损坏 → 直接失败 */
 	if (unlikely(f2fs_cp_error(sbi))) {
 		ret = -EIO;
 		from_dnode = false;
 		goto out_put_dnode;
 	}
 
+	/* 断言：集群必须非空（上层已保证）*/
 	f2fs_bug_on(sbi, f2fs_cluster_is_empty(cc));
 
+	/* 文件最后一个块号（用于后面剔除 beyond-EOF 页）*/
 	last_block_in_file = F2FS_BYTES_TO_BLK(f2fs_readpage_limit(inode) +
 							blocksize - 1);
 
 	/* get rid of pages beyond EOF */
+	/* 2. 先剔除 beyond-EOF 的页（压缩后可能超出文件大小）*/
 	for (i = 0; i < cc->cluster_size; i++) {
 		struct page *page = cc->rpages[i];
 		struct folio *folio;
 
-		if (!page)
+		if (!page)	/* 跳过空槽 */
 			continue;
 
 		folio = page_folio(page);
 		if ((sector_t)folio->index >= last_block_in_file) {
-			folio_zero_segment(folio, 0, folio_size(folio));
+			folio_zero_segment(folio, 0, folio_size(folio));	/* 清零整页 */
 			if (!folio_test_uptodate(folio))
-				folio_mark_uptodate(folio);
+				folio_mark_uptodate(folio);	/* 标记 uptodate（避免再次读盘）*/
 		} else if (!folio_test_uptodate(folio)) {
-			continue;
+			continue;	/* 非 uptodate → 留待后面读盘 */
 		}
-		folio_unlock(folio);
+		folio_unlock(folio);	/* 已 uptodate 或 beyond-EOF → 解锁并释放引用（不再读盘）*/
 		if (for_write)
-			folio_put(folio);
-		cc->rpages[i] = NULL;
-		cc->nr_rpages--;
+			folio_put(folio);	/* for_write 场景释放引用 */
+		cc->rpages[i] = NULL;	/* 清槽 */
+		cc->nr_rpages--;	/* 减少待读页数 */
 	}
 
 	/* we are done since all pages are beyond EOF */
-	if (f2fs_cluster_is_empty(cc))
+	if (f2fs_cluster_is_empty(cc))	/* 3. 若剔除后无页可读 → 直接返回成功（全部 beyond-EOF）*/
 		goto out;
 
+	/* 4. 尝试用 extent cache 读地址（若命中则无需走 node 块）*/
 	if (f2fs_lookup_read_extent_cache(inode, start_idx, &ei))
-		from_dnode = false;
+		from_dnode = false;	/* 命中 extent cache */
 
 	if (!from_dnode)
-		goto skip_reading_dnode;
-
+		goto skip_reading_dnode;	/* 跳过 node 块读取 */
+	/* 5. 从 node 块读取 16 个压缩块地址 */
 	set_new_dnode(&dn, inode, NULL, NULL, 0);
 	ret = f2fs_get_dnode_of_data(&dn, start_idx, LOOKUP_NODE);
 	if (ret)
-		goto out;
+		goto out;	 /* node 块读失败 */
 
-	f2fs_bug_on(sbi, dn.data_blkaddr != COMPRESS_ADDR);
+	f2fs_bug_on(sbi, dn.data_blkaddr != COMPRESS_ADDR);	/* 断言：必须是压缩标记块 */
 
 skip_reading_dnode:
+	/* 6. 统计有多少个存放了压缩的数据的block */
+	// 从 node 块或 extent cache 取出 15 个压缩子块地址（第 0 块是头）
+	// 注意这里是从1开始循环，跳过第0块
+	// 而对于没有存放压缩数据的block，遇到之后直接跳出循环了
 	for (i = 1; i < cc->cluster_size; i++) {
 		block_t blkaddr;
-
+		
+		/* 从 node 块或 extent cache 取第 i 个子块地址 */
 		blkaddr = from_dnode ? data_blkaddr(dn.inode, dn.node_folio,
 					dn.ofs_in_node + i) :
 					ei.blk + i - 1;
 
 		if (!__is_valid_data_blkaddr(blkaddr))
-			break;
+			break;	/* 地址无效 → 跳出 */
 
 		if (!f2fs_is_valid_blkaddr(sbi, blkaddr, DATA_GENERIC)) {
 			ret = -EFAULT;
 			goto out_put_dnode;
 		}
-		cc->nr_cpages++;
+		cc->nr_cpages++;	/* 计数压缩子块 */
 
-		if (!from_dnode && i >= ei.c_len)
+		if (!from_dnode && i >= ei.c_len)	/* extent cache 长度用尽 */
 			break;
 	}
 
 	/* nothing to decompress */
+	/* 7. 若无子块可读 → 跳出（无压缩数据）*/
 	if (cc->nr_cpages == 0) {
 		ret = 0;
 		goto out_put_dnode;
 	}
 
-	dic = f2fs_alloc_dic(cc);
+	dic = f2fs_alloc_dic(cc);	/* 8. 分配解压缩 I/O 上下文（异步解压用）*/
 	if (IS_ERR(dic)) {
 		ret = PTR_ERR(dic);
 		goto out_put_dnode;
 	}
 
+	/* 9. 逐压缩子块提交读 BIO → 异步解压 */
 	for (i = 0; i < cc->nr_cpages; i++) {
-		struct folio *folio = page_folio(dic->cpages[i]);
+		struct folio *folio = page_folio(dic->cpages[i]);	/* 解压目标页（原始 4K）*/
 		block_t blkaddr;
 		struct bio_post_read_ctx *ctx;
-
+		/* 从 node 或 extent 取子块地址 */
 		blkaddr = from_dnode ? data_blkaddr(dn.inode, dn.node_folio,
 					dn.ofs_in_node + i + 1) :
 					ei.blk + i;
-
+		/* 等待子块写回完成（防止读-写冲突）*/
 		f2fs_wait_on_block_writeback(inode, blkaddr);
-
+		/* 子块已在 page cache → 直接拷贝到解压目标页 */
 		if (f2fs_load_compressed_folio(sbi, folio, blkaddr)) {
+			/* 最后一个子块拷贝完成 → 触发异步解压 */
 			if (atomic_dec_and_test(&dic->remaining_pages)) {
+				// 如果只有部分子块命中缓存，剩余子块仍需磁盘读 + 解压，
+				// 那么 f2fs_decompress_cluster() 会走正常解压流程，把未命中部分解压出来，再与缓存命中的部分拼接成完整簇。
 				f2fs_decompress_cluster(dic, true);
 				break;
 			}
-			continue;
+			continue;	/* 还有子块没读完，继续 */
 		}
-
+		/* 子块不在 cache → 提交读 BIO */
 		if (bio && (!page_is_mergeable(sbi, bio,
 					*last_block_in_bio, blkaddr) ||
 		    !f2fs_crypt_mergeable_bio(bio, inode, folio->index, NULL))) {
 submit_and_realloc:
-			f2fs_submit_read_bio(sbi, bio, DATA);
-			bio = NULL;
+			f2fs_submit_read_bio(sbi, bio, DATA);	/* 提交旧 bio */
+			bio = NULL;	/* 准备新 bio */
 		}
 
 		if (!bio) {
+			/* 分配新读 bio */
 			bio = f2fs_grab_read_bio(inode, blkaddr, nr_pages,
 					f2fs_ra_op_flags(rac),
 					folio->index, for_write);
 			if (IS_ERR(bio)) {
 				ret = PTR_ERR(bio);
-				f2fs_decompress_end_io(dic, ret, true);
+				f2fs_decompress_end_io(dic, ret, true);	/* 标记解压失败 */
 				f2fs_put_dnode(&dn);
 				*bio_ret = NULL;
 				return ret;
 			}
 		}
-
+		/* 把子块 folio 加入 bio → 读后触发解压回调 */
 		if (!bio_add_folio(bio, folio, blocksize, 0))
-			goto submit_and_realloc;
-
+			goto submit_and_realloc;	/* bio 满了，先提交再重加 */
+		/* 设置 post-read 回调：解压 */
 		ctx = get_post_read_ctx(bio);
 		ctx->enabled_steps |= STEP_DECOMPRESS;
-		refcount_inc(&dic->refcnt);
-
+		refcount_inc(&dic->refcnt);	/* 防止提前释放 dic */
+		/* 统计 & 更新最后块号 */
 		inc_page_count(sbi, F2FS_RD_DATA);
 		f2fs_update_iostat(sbi, inode, FS_DATA_READ_IO, F2FS_BLKSIZE);
 		*last_block_in_bio = blkaddr;
 	}
-
+	/* 10. 释放 node 块引用，返回 bio链供上层继续追加 */
 	if (from_dnode)
 		f2fs_put_dnode(&dn);
 
-	*bio_ret = bio;
-	return 0;
+	*bio_ret = bio;	/* 返回 bio 链，上层可继续追加 */
+	return 0;	/* 成功返回 */
 
+/* ===== 错误清理路径 ===== */
 out_put_dnode:
 	if (from_dnode)
 		f2fs_put_dnode(&dn);
-out:
+out:	/* 错误时：解锁并清 uptodate 标记，防止后续误用 */
 	for (i = 0; i < cc->cluster_size; i++) {
 		if (cc->rpages[i]) {
 			ClearPageUptodate(cc->rpages[i]);
@@ -2344,7 +2455,7 @@ out:
 		}
 	}
 	*bio_ret = bio;
-	return ret;
+	return ret;	/* 返回错误码 */
 }
 #endif
 
@@ -2352,28 +2463,33 @@ out:
  * This function was originally taken from fs/mpage.c, and customized for f2fs.
  * Major change was from block_size == page_size in f2fs by default.
  */
+// 批量读数据页/压缩簇
+/*
+ * 源自 mpage.c，专为 f2fs 定制：默认 block_size == page_size。
+ * 支持普通页连续读，也支持压缩簇批量读。
+ */
 static int f2fs_mpage_readpages(struct inode *inode,
 		struct readahead_control *rac, struct folio *folio)
 {
-	struct bio *bio = NULL;
-	sector_t last_block_in_bio = 0;
-	struct f2fs_map_blocks map;
+	struct bio *bio = NULL;	/* 正在攒的读 bio */
+	sector_t last_block_in_bio = 0;	/* bio 中最后一个块号 */
+	struct f2fs_map_blocks map;	/* 块映射查询结构 */
 #ifdef CONFIG_F2FS_FS_COMPRESSION
-	struct compress_ctx cc = {
+	struct compress_ctx cc = {	/* 压缩读上下文 */
 		.inode = inode,
 		.log_cluster_size = F2FS_I(inode)->i_log_cluster_size,
 		.cluster_size = F2FS_I(inode)->i_cluster_size,
-		.cluster_idx = NULL_CLUSTER,
+		.cluster_idx = NULL_CLUSTER,	/* 初始化为“未绑定簇” */
 		.rpages = NULL,
 		.cpages = NULL,
 		.nr_rpages = 0,
 		.nr_cpages = 0,
 	};
-	pgoff_t nc_cluster_idx = NULL_CLUSTER;
-	pgoff_t index;
+	pgoff_t nc_cluster_idx = NULL_CLUSTER;	/* 记录最近遇到的非压缩簇号，避免重复判断 */
+	pgoff_t index;	/* 当前 folio 的页索引 */
 #endif
-	unsigned nr_pages = rac ? readahead_count(rac) : 1;
-	unsigned max_nr_pages = nr_pages;
+	unsigned nr_pages = rac ? readahead_count(rac) : 1;	/* 总页数 */
+	unsigned max_nr_pages = nr_pages;	/* 用于 bio 上限计算 */
 	int ret = 0;
 
 	map.m_pblk = 0;
@@ -2385,19 +2501,21 @@ static int f2fs_mpage_readpages(struct inode *inode,
 	map.m_seg_type = NO_CHECK_TYPE;
 	map.m_may_create = false;
 
+	/* 主循环：逐页处理 */
 	for (; nr_pages; nr_pages--) {
-		if (rac) {
+		if (rac) {	/* 预读场景取出下一页 */
 			folio = readahead_folio(rac);
-			prefetchw(&folio->flags);
+			prefetchw(&folio->flags);	/* 提前拿锁缓存行，减少锁竞争 */
 		}
 
 #ifdef CONFIG_F2FS_FS_COMPRESSION
 		index = folio->index;
 
-		if (!f2fs_compressed_file(inode))
+		if (!f2fs_compressed_file(inode))	/* 文件没开压缩 → 单页读 */
 			goto read_single_page;
 
 		/* there are remained compressed pages, submit them */
+		/* 当前页跟 cc 里攒的簇不连续，先把簇读出去 */
 		if (!f2fs_cluster_can_merge_page(&cc, index)) {
 			ret = f2fs_read_multi_pages(&cc, &bio,
 						max_nr_pages,
@@ -2407,14 +2525,16 @@ static int f2fs_mpage_readpages(struct inode *inode,
 			if (ret)
 				goto set_error_page;
 		}
+		/* 新簇开始：判断是否真是压缩簇 */
 		if (cc.cluster_idx == NULL_CLUSTER) {
+			/* 已知非压缩，单页读 */
 			if (nc_cluster_idx == index >> cc.log_cluster_size)
 				goto read_single_page;
 
 			ret = f2fs_is_compressed_cluster(inode, index);
 			if (ret < 0)
 				goto set_error_page;
-			else if (!ret) {
+			else if (!ret) {	/* 非压缩簇 */
 				nc_cluster_idx =
 					index >> cc.log_cluster_size;
 				goto read_single_page;
@@ -2422,16 +2542,17 @@ static int f2fs_mpage_readpages(struct inode *inode,
 
 			nc_cluster_idx = NULL_CLUSTER;
 		}
+		/* 初始化压缩上下文，把页收进来 */
 		ret = f2fs_init_compress_ctx(&cc);
 		if (ret)
 			goto set_error_page;
 
 		f2fs_compress_ctx_add_page(&cc, folio);
 
-		goto next_page;
+		goto next_page;	/* 继续攒簇 */
 read_single_page:
 #endif
-
+		/* 普通路径：单页读 */
 		ret = f2fs_read_single_page(inode, folio, max_nr_pages, &map,
 					&bio, &last_block_in_bio, rac);
 		if (ret) {
@@ -2446,6 +2567,7 @@ next_page:
 #endif
 
 #ifdef CONFIG_F2FS_FS_COMPRESSION
+		/* 循环最后一页：把剩余压缩簇读出去 */
 		if (f2fs_compressed_file(inode)) {
 			/* last page */
 			if (nr_pages == 1 && !f2fs_cluster_is_empty(&cc)) {
@@ -2458,44 +2580,50 @@ next_page:
 		}
 #endif
 	}
-	if (bio)
+	if (bio)	/* 提交剩余 bio */
 		f2fs_submit_read_bio(F2FS_I_SB(inode), bio, DATA);
 	return ret;
 }
 
+// 读取一个数据 folio:先查压缩，再试 inline，不行就 mpage——三步读完一页。
 static int f2fs_read_data_folio(struct file *file, struct folio *folio)
 {
-	struct inode *inode = folio->mapping->host;
-	int ret = -EAGAIN;
+	struct inode *inode = folio->mapping->host;	/* 通过 folio 找到所属 inode */
+	int ret = -EAGAIN;	/* 预设“待重试” */
 
-	trace_f2fs_readpage(folio, DATA);
+	trace_f2fs_readpage(folio, DATA);	/* trace 打点 */
 
-	if (!f2fs_is_compress_backend_ready(inode)) {
+	if (!f2fs_is_compress_backend_ready(inode)) {	/* 压缩模块没准备好就直接报错 */
 		folio_unlock(folio);
 		return -EOPNOTSUPP;
 	}
 
 	/* If the file has inline data, try to read it directly */
+	/* 若文件启用了 inline 数据，先尝试 inline 方式读 */
 	if (f2fs_has_inline_data(inode))
 		ret = f2fs_read_inline_data(inode, folio);
+	/* inline 没命中或返回 -EAGAIN，再走常规 mpage 读路径 */
 	if (ret == -EAGAIN)
 		ret = f2fs_mpage_readpages(inode, NULL, folio);
 	return ret;
 }
 
+// F2FS 读预取（readahead）入口
 static void f2fs_readahead(struct readahead_control *rac)
 {
 	struct inode *inode = rac->mapping->host;
 
+	/* trace 打点：记录本次预取起始页号与页数 */
 	trace_f2fs_readpages(inode, readahead_index(rac), readahead_count(rac));
-
+	/* 1. 压缩后端未就绪 → 直接放弃预取（避免解压失败） */
 	if (!f2fs_is_compress_backend_ready(inode))
 		return;
 
 	/* If the file has inline data, skip readahead */
+	/* 2. 文件采用 inline 数据 → 无块可预取，直接返回 */
 	if (f2fs_has_inline_data(inode))
 		return;
-
+	/* 3. 统一走 mpage 批量读路径（支持普通页/压缩簇混合读取） */
 	f2fs_mpage_readpages(inode, rac, NULL);
 }
 
@@ -2928,21 +3056,26 @@ redirty_out:
  * The major change is making write step of cold data page separately from
  * warm/hot data page.
  */
+/*
+ * F2FS 回写核心循环（基于 mm/page-writeback.c 改写）：
+ * 主要变化：把冷数据页写回步骤与热/温数据页分开处理，
+ * 并支持压缩写路径。
+ */
 static int f2fs_write_cache_pages(struct address_space *mapping,
 					struct writeback_control *wbc,
 					enum iostat_type io_type)
 {
-	int ret = 0;
-	int done = 0, retry = 0;
-	struct page *pages_local[F2FS_ONSTACK_PAGES];
-	struct page **pages = pages_local;
-	struct folio_batch fbatch;
-	struct f2fs_sb_info *sbi = F2FS_M_SB(mapping);
-	struct bio *bio = NULL;
-	sector_t last_block;
+	int ret = 0;	/* 函数返回值：0 成功，负值错误 */
+	int done = 0, retry = 0;	/* done=提前结束标志，retry=重扫标志 */
+	struct page *pages_local[F2FS_ONSTACK_PAGES];	/* 栈上页指针缓存（默认 16 项） */
+	struct page **pages = pages_local;	/* 默认指向栈数组 */
+	struct folio_batch fbatch;	/* folio 批获取结构 */
+	struct f2fs_sb_info *sbi = F2FS_M_SB(mapping);	/* 超级块信息 */
+	struct bio *bio = NULL;	/* IPU 原地写 bio 缓存 */
+	sector_t last_block;	/* 用于 bio 合并 */
 #ifdef CONFIG_F2FS_FS_COMPRESSION
-	struct inode *inode = mapping->host;
-	struct compress_ctx cc = {
+	struct inode *inode = mapping->host;	/* 获取文件inode */
+	struct compress_ctx cc = {	/* 预建压缩上下文（默认 cluster=16 页） */
 		.inode = inode,
 		.log_cluster_size = F2FS_I(inode)->i_log_cluster_size,
 		.cluster_size = F2FS_I(inode)->i_cluster_size,
@@ -2957,18 +3090,19 @@ static int f2fs_write_cache_pages(struct address_space *mapping,
 		.private = NULL,
 	};
 #endif
-	int nr_folios, p, idx;
-	int nr_pages;
-	unsigned int max_pages = F2FS_ONSTACK_PAGES;
-	pgoff_t index;
-	pgoff_t end;		/* Inclusive */
-	pgoff_t done_index;
-	int range_whole = 0;
-	xa_mark_t tag;
-	int nwritten = 0;
-	int submitted = 0;
-	int i;
+	int nr_folios, p, idx;	/* folio 批计数 & 页内偏移 */
+	int nr_pages;	/* 本批实际攒到的页数 */
+	unsigned int max_pages = F2FS_ONSTACK_PAGES;	/* 默认最多 16 页 */
+	pgoff_t index;	/* 起始页号 */
+	pgoff_t end;		/* Inclusive */	/* 结束页号（含） */
+	pgoff_t done_index;	/* 已处理到的页号 */
+	int range_whole = 0;	/* 是否整文件回写 */
+	xa_mark_t tag;	/* folio 批获取标签 */
+	int nwritten = 0;	/* 本函数累计写页数 */
+	int submitted = 0;	/* 本轮 bio 已提交页数 */
+	int i;	/* 循环变量 */
 
+/* 若开启压缩且 cluster > 16 页，动态分配大数组，避免栈溢出 */
 #ifdef CONFIG_F2FS_FS_COMPRESSION
 	if (f2fs_compressed_file(inode) &&
 		1 << cc.log_cluster_size > F2FS_ONSTACK_PAGES) {
@@ -2978,203 +3112,226 @@ static int f2fs_write_cache_pages(struct address_space *mapping,
 	}
 #endif
 
-	folio_batch_init(&fbatch);
+	folio_batch_init(&fbatch);	/* 初始化 folio 批获取结构 */
 
+	/* 脏页太少 → 标记为热数据，后续进热段 */
 	if (get_dirty_pages(mapping->host) <=
 				SM_I(F2FS_M_SB(mapping))->min_hot_blocks)
 		set_inode_flag(mapping->host, FI_HOT_DATA);
 	else
 		clear_inode_flag(mapping->host, FI_HOT_DATA);
 
+	/* 根据 wbc 模式设置起始/结束页号 */
 	if (wbc->range_cyclic) {
-		index = mapping->writeback_index; /* prev offset */
-		end = -1;
+		index = mapping->writeback_index; /* prev offset */	/* 上次断点继续 */
+		end = -1;	/* 直到文件末尾 */
 	} else {
-		index = wbc->range_start >> PAGE_SHIFT;
-		end = wbc->range_end >> PAGE_SHIFT;
+		index = wbc->range_start >> PAGE_SHIFT;	/* 显式起始页号 */
+		end = wbc->range_end >> PAGE_SHIFT;	/* 显式结束页号（含） */
 		if (wbc->range_start == 0 && wbc->range_end == LLONG_MAX)
-			range_whole = 1;
+			range_whole = 1;	/* 整文件回写标志 */
 	}
+	/* 选择 folio 批获取标签：TOWRITE=同步，DIRTY=后台 */
 	if (wbc->sync_mode == WB_SYNC_ALL || wbc->tagged_writepages)
 		tag = PAGECACHE_TAG_TOWRITE;
 	else
 		tag = PAGECACHE_TAG_DIRTY;
 retry:
-	retry = 0;
+	retry = 0;	/* 重扫标志复位 */
 	if (wbc->sync_mode == WB_SYNC_ALL || wbc->tagged_writepages)
-		tag_pages_for_writeback(mapping, index, end);
-	done_index = index;
+		tag_pages_for_writeback(mapping, index, end);	/* 给页打标签 */
+	done_index = index;	 /* 记录已处理页号 */
+	/* 大 while：逐批获取 folio，攒够 max_pages 就写一次 */
 	while (!done && !retry && (index <= end)) {
-		nr_pages = 0;
+		nr_pages = 0;	/* 本批页数清零 */
 again:
+		/* 一次性拿一批 folio（可能跨多个 folio）*/
 		nr_folios = filemap_get_folios_tag(mapping, &index, end,
 				tag, &fbatch);
-		if (nr_folios == 0) {
-			if (nr_pages)
+		if (nr_folios == 0) {	/* 没拿到 folio */
+			if (nr_pages)	/* 但有残页 → 写它们 */
 				goto write;
-			break;
+			break;	/* 真没页了，跳出大循环 */
 		}
-
+		/* 把每个 folio 拆成 page 塞进 pages[]，直到攒满 max_pages */
 		for (i = 0; i < nr_folios; i++) {
 			struct folio *folio = fbatch.folios[i];
 
 			idx = 0;
-			p = folio_nr_pages(folio);
+			p = folio_nr_pages(folio);	/* 这个 folio 里有多少页 */
 add_more:
-			pages[nr_pages] = folio_page(folio, idx);
-			folio_get(folio);
-			if (++nr_pages == max_pages) {
-				index = folio->index + idx + 1;
-				folio_batch_release(&fbatch);
-				goto write;
+			pages[nr_pages] = folio_page(folio, idx);	/* 取第 idx 页 */
+			folio_get(folio);	/* 增加 folio 引用 */
+			if (++nr_pages == max_pages) {	/* 攒满上限 → 进入写阶段 */
+				index = folio->index + idx + 1;	/* 更新下一起始页号 */
+				folio_batch_release(&fbatch);	/* 释放 folio 批引用 */
+				goto write;	/* 跳去写 */
 			}
-			if (++idx < p)
+			if (++idx < p)	/* 本 folio 还有页没拆完 */
 				goto add_more;
 		}
-		folio_batch_release(&fbatch);
-		goto again;
-write:
+		folio_batch_release(&fbatch);	/* 本批 folio 已拆完，释放引用 */
+		goto again;	/* 继续拆下一批 folio */
+write:	/* 对 pages[0..nr_pages-1] 逐个处理：压缩 or 原样写 */
 		for (i = 0; i < nr_pages; i++) {
 			struct page *page = pages[i];
 			struct folio *folio = page_folio(page);
-			bool need_readd;
+			bool need_readd;	/* 是否需要重新加入 cluster */
 readd:
 			need_readd = false;
+/* ===== 压缩路径 ===== */
 #ifdef CONFIG_F2FS_FS_COMPRESSION
 			if (f2fs_compressed_file(inode)) {
 				void *fsdata = NULL;
 				struct page *pagep;
 				int ret2;
-
+				
+				/* 初始化压缩上下文，主要是初始化rpages数组 */
 				ret = f2fs_init_compress_ctx(&cc);
 				if (ret) {
-					done = 1;
+					done = 1;	/* 初始化失败 → 结束循环 */
 					break;
 				}
-
+				/* 当前页不能合并到旧 cluster → 先 flush 旧 cluster */
 				if (!f2fs_cluster_can_merge_page(&cc,
 								folio->index)) {
+					// 把当前 cluster 里的页（15 个）压缩后提交写入到存储器件中
 					ret = f2fs_write_multi_pages(&cc,
 						&submitted, wbc, io_type);
 					if (!ret)
-						need_readd = true;
+						need_readd = true;	/* 旧 cluster 已 flush，重新添加当前页 */
 					goto result;
 				}
-
+				/* 各种熔断检查（CP 错误、cluster 空、页 ready）*/
 				if (unlikely(f2fs_cp_error(sbi)))
 					goto lock_folio;
-
+				
+				// “当前页已经被成功加入旧 cluster，不再需要做『合并/压缩』逻辑，直接对它加锁、原样写即可。”
+				// “如果当前压缩集群里已经有页（非空），就直接去加页锁，不再尝试合并/压缩逻辑。”
+				// 集群非空 → 说明 前面已经攒了若干页，当前页被判定为“能合并”。
+				// 立即跳转到 lock_folio: → 不再走压缩合并逻辑，直接对当前页加锁，并加入到cluster中。
+				// 保证数据正确性 → 不把一个不连续的页硬塞进旧 cluster，避免压缩后无法还原。
 				if (!f2fs_cluster_is_empty(&cc))
 					goto lock_folio;
 
 				if (f2fs_all_cluster_page_ready(&cc,
 					pages, i, nr_pages, true))
 					goto lock_folio;
-
+				
+				// 对于属于当前cluster第一个被处理的page，需要进行如下的处理：对于属于当前cluster的数据进行预读
+				/* 准备 inline 压缩覆盖写（压缩覆盖写路径）*/
 				ret2 = f2fs_prepare_compress_overwrite(
 							inode, &pagep,
 							folio->index, &fsdata);
 				if (ret2 < 0) {
-					ret = ret2;
+					ret = ret2;	/* 失败 → 返回错误 */
 					done = 1;
 					break;
+				// 如果已经准备好压缩覆盖写，但是当前的页不是cluster的首页或者不能压缩，则扫描整个文件，重试
 				} else if (ret2 &&
 					(!f2fs_compress_write_end(inode,
 						fsdata, folio->index, 1) ||
 					 !f2fs_all_cluster_page_ready(&cc,
 						pages, i, nr_pages,
 						false))) {
-					retry = 1;
+					retry = 1;	/* inline 压缩失败 → 重扫全文件 */
 					break;
 				}
 			}
 #endif
 			/* give a priority to WB_SYNC threads */
+			/* 如果当前有 SYNC_ALL 在跑，非 SYNC 线程直接提前结束，避免饿死 */
 			if (atomic_read(&sbi->wb_sync_req[DATA]) &&
 					wbc->sync_mode == WB_SYNC_NONE) {
-				done = 1;
+				done = 1;	/* 提前结束大循环 */
 				break;
 			}
 #ifdef CONFIG_F2FS_FS_COMPRESSION
 lock_folio:
 #endif
-			done_index = folio->index;
-retry_write:
-			folio_lock(folio);
-
+			done_index = folio->index;	/* 记录已处理页号 */
+retry_write:	/* 写失败重试入口 */
+			folio_lock(folio);	/* 加页锁 */
+			
+			/* 页被 truncate 走了 → 解锁并跳过 */
 			if (unlikely(folio->mapping != mapping)) {
 continue_unlock:
 				folio_unlock(folio);
 				continue;
 			}
-
+			/* 页已经不脏了 → 解锁并跳过（别人帮我们写了）*/
 			if (!folio_test_dirty(folio)) {
 				/* someone wrote it for us */
 				goto continue_unlock;
 			}
-
+			/* 页正在回写中 */
 			if (folio_test_writeback(folio)) {
-				if (wbc->sync_mode == WB_SYNC_NONE)
+				if (wbc->sync_mode == WB_SYNC_NONE)	/* 后台模式：跳过，不阻塞 */
 					goto continue_unlock;
+				/* SYNC_ALL 模式：等待回写完成再写 */
 				f2fs_folio_wait_writeback(folio, DATA, true, true);
 			}
-
+			/* 清除 dirty 标记，准备写 IO */
 			if (!folio_clear_dirty_for_io(folio))
 				goto continue_unlock;
 
 #ifdef CONFIG_F2FS_FS_COMPRESSION
-			if (f2fs_compressed_file(inode)) {
+			if (f2fs_compressed_file(inode)) {	// 此时，才将page正式加入到压缩要用的cluster中
 				folio_get(folio);
 				f2fs_compress_ctx_add_page(&cc, folio);
-				continue;
+				continue;	// 继续处理下一页
 			}
 #endif
-			submitted = 0;
+/* ===== 原样写路径 ===== */
+			submitted = 0;	/* 本轮 bio 提交页数清零 */
 			ret = f2fs_write_single_data_page(folio,
 					&submitted, &bio, &last_block,
 					wbc, io_type, 0, true);
 #ifdef CONFIG_F2FS_FS_COMPRESSION
 result:
 #endif
-			nwritten += submitted;
-			wbc->nr_to_write -= submitted;
+			nwritten += submitted;	/* 累计已写页数 */
+			wbc->nr_to_write -= submitted;	 /* 剩余配额减少 */
 
-			if (unlikely(ret)) {
+			if (unlikely(ret)) {	/* 错误处理分支：-EAGAIN 重试，其他错误结束循环 */
 				/*
 				 * keep nr_to_write, since vfs uses this to
 				 * get # of written pages.
 				 */
-				if (ret == 1) {
+				if (ret == 1) {	/* ret=1 表示“已写但不是本函数写的”，继续 */
 					ret = 0;
 					goto next;
-				} else if (ret == -EAGAIN) {
+				} else if (ret == -EAGAIN) {	/* SYNC_ALL 模式：等一会儿再重试 */
 					ret = 0;
 					if (wbc->sync_mode == WB_SYNC_ALL) {
 						f2fs_io_schedule_timeout(
 							DEFAULT_IO_TIMEOUT);
 						goto retry_write;
 					}
-					goto next;
+					goto next;	/* 非 SYNC：跳过，不阻塞 */
 				}
+				/* 其他负值错误 → 结束循环 */
 				done_index = folio_next_index(folio);
 				done = 1;
 				break;
 			}
-
+			/* 非同步模式且配额用完 → 提前结束 */
 			if (wbc->nr_to_write <= 0 &&
 					wbc->sync_mode == WB_SYNC_NONE) {
 				done = 1;
 				break;
 			}
 next:
-			if (need_readd)
+			if (need_readd)	/* 重新把当前页加入新 cluster */
 				goto readd;
 		}
+		/* 释放本批 page 引用，让调度呼吸 */
 		release_pages(pages, nr_pages);
 		cond_resched();
 	}
 #ifdef CONFIG_F2FS_FS_COMPRESSION
 	/* flush remained pages in compress cluster */
+	/* ===== 压缩残余页 flush =====：循环结束后可能还有未写 cluster */
 	if (f2fs_compressed_file(inode) && !f2fs_cluster_is_empty(&cc)) {
 		ret = f2fs_write_multi_pages(&cc, &submitted, wbc, io_type);
 		nwritten += submitted;
@@ -3184,20 +3341,23 @@ next:
 			retry = 0;
 		}
 	}
+	/* 销毁压缩上下文 */
 	if (f2fs_compressed_file(inode))
 		f2fs_destroy_compress_ctx(&cc, false);
 #endif
-	if (retry) {
+	/* ===== 收尾 & 重扫 ===== */
+	if (retry) {	 /* 之前 inline 压缩失败，重扫全文件 */
 		index = 0;
 		end = -1;
 		goto retry;
 	}
-	if (wbc->range_cyclic && !done)
+	if (wbc->range_cyclic && !done)	/* 循环写模式：断点归零 */
 		done_index = 0;
+	/* 记录断点，下次继续 */
 	if (wbc->range_cyclic || (range_whole && wbc->nr_to_write > 0))
 		mapping->writeback_index = done_index;
 
-	if (nwritten)
+	if (nwritten)	/* 提交合并的 DATA/IPU bio */
 		f2fs_submit_merged_write_cond(F2FS_M_SB(mapping), mapping->host,
 								NULL, 0, DATA);
 	/* submit cached bio of IPU write */
@@ -3205,52 +3365,76 @@ next:
 		f2fs_submit_merged_ipu_write(sbi, &bio, NULL);
 
 #ifdef CONFIG_F2FS_FS_COMPRESSION
-	if (pages != pages_local)
+	if (pages != pages_local)	/* 释放动态分配的大数组 */
 		kfree(pages);
 #endif
 
-	return ret;
+	return ret;	/* 返回 0 或错误码 */
 }
 
+/* “是否要对当前 inode 的写回加串行锁” 的快速判断函数:
+ * “只要不是后台 flusher，且文件满足压缩/大脏页/SYNC_ALL 任一条件，
+ * 就加 writepages 互斥锁，防止并发写造成死锁或 IO 分裂。” 
+ * */
 static inline bool __should_serialize_io(struct inode *inode,
 					struct writeback_control *wbc)
 {
 	/* to avoid deadlock in path of data flush */
+	/* 1. 如果当前任务本身就是 WB 线程（background flusher），直接不加锁
+	 *    避免“自己等自己”死锁 */
 	if (F2FS_I(inode)->wb_task)
 		return false;
-
+	/* 2. 非普通文件（目录、设备、socket 等）不加锁 */
 	if (!S_ISREG(inode->i_mode))
 		return false;
+	/* 3. quota 文件不加锁（quota 有自己的序列化机制） */
 	if (IS_NOQUOTA(inode))
 		return false;
-
+	/* 4. 压缩文件 → 必须加锁
+	 *    防止多个并发写把同一个 cluster 拆散，导致压缩失败或数据错位 */
 	if (f2fs_need_compress_data(inode))
 		return true;
+	/* 5. 非 SYNC_ALL（后台 flusher）→ 加锁
+	 *    避免后台线程和 fsync 混跑造成 IO 分裂 */
 	if (wbc->sync_mode != WB_SYNC_ALL)
 		return true;
+	/* 6. 脏页数 ≥ 阈值（默认 64 页）→ 加锁
+	 *    大写回批量一次性完成，减少多次小 BIO */
 	if (get_dirty_pages(inode) >= SM_I(F2FS_I_SB(inode))->min_seq_blocks)
 		return true;
 	return false;
 }
 
+/*
+ * F2FS 真正回写 DATA 页的核心函数：
+ * 1. 各种“跳过写”熔断器
+ * 2. 加 plug 合并 BIO
+ * 3. 调用 f2fs_write_cache_pages 刷脏页
+ * 4. 清理 dirty inode 标记
+ */
 static int __f2fs_write_data_pages(struct address_space *mapping,
 						struct writeback_control *wbc,
 						enum iostat_type io_type)
 {
 	struct inode *inode = mapping->host;
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
-	struct blk_plug plug;
+	struct blk_plug plug;	/* BIO 合并插头 */
 	int ret;
 	bool locked = false;
 
 	/* skip writing if there is no dirty page in this inode */
+	/* 1. 没有脏页且是非同步回写 → 直接回家 */
 	if (!get_dirty_pages(inode) && wbc->sync_mode == WB_SYNC_NONE)
 		return 0;
 
 	/* during POR, we don't need to trigger writepage at all. */
+	/* 2. POR（前滚恢复）阶段 → 禁止任何写页 */
 	if (unlikely(is_sbi_flag_set(sbi, SBI_POR_DOING)))
 		goto skip_write;
 
+	/* 3. 目录/配额文件 + 非同步 + 脏页很少 + 内存充足 → 跳过写
+	 *    目的：让大量小目录创建不触发频繁回写，延长聚合时间 
+	 */
 	if ((S_ISDIR(inode->i_mode) || IS_NOQUOTA(inode)) &&
 			wbc->sync_mode == WB_SYNC_NONE &&
 			get_dirty_pages(inode) < nr_pages_to_skip(sbi, DATA) &&
@@ -3258,54 +3442,73 @@ static int __f2fs_write_data_pages(struct address_space *mapping,
 		goto skip_write;
 
 	/* skip writing in file defragment preparing stage */
+	/* 4. 文件正在做 defrag（fsck.f2fs -d）→ 跳过写，防止搬移时又被弄脏 */
 	if (is_inode_flag_set(inode, FI_SKIP_WRITES))
 		goto skip_write;
 
+	/* 5. trace 点：开始回写 */
 	trace_f2fs_writepages(mapping->host, wbc, DATA);
 
 	/* to avoid spliting IOs due to mixed WB_SYNC_ALL and WB_SYNC_NONE */
+	/* 6. 避免 WB_SYNC_ALL 与 WB_SYNC_NONE 混用造成 IO 分裂
+	 *    策略：只要有 SYNC_ALL 在跑，非 SYNC 直接跳过
+	 * 	WB_SYNC_ALL = 必须等到脏页落盘才返回（阻塞）, 常被fsync、sync、msync调用；
+	 *  WB_SYNC_NONE = 把脏页交给 BIO 队列 就返回（非阻塞），常被balance_dirty_pages、周期性 flusher 线程调用。
+	 */
 	if (wbc->sync_mode == WB_SYNC_ALL)
 		atomic_inc(&sbi->wb_sync_req[DATA]);
 	else if (atomic_read(&sbi->wb_sync_req[DATA])) {
 		/* to avoid potential deadlock */
-		if (current->plug)
+		if (current->plug)	/* 防止潜在死锁：先 finish 当前 plug 再跳过 */
 			blk_finish_plug(current->plug);
 		goto skip_write;
 	}
 
+	/* 7. 某些 inode（如压缩文件）需要串行化写 → 加全局 writepages 锁 */
 	if (__should_serialize_io(inode, wbc)) {
 		mutex_lock(&sbi->writepages);
 		locked = true;
 	}
-
+	/* 8. 标准 BIO 合并：plug 开始 */
 	blk_start_plug(&plug);
+	/* 9. 真正刷页：进入 f2fs_write_cache_pages 大循环 */
 	ret = f2fs_write_cache_pages(mapping, wbc, io_type);
+	/* 10. plug 结束 → 合并提交 BIO */
 	blk_finish_plug(&plug);
 
-	if (locked)
+	if (locked)	/* 11. 释放串行化锁 */
 		mutex_unlock(&sbi->writepages);
-
+	/* 12. SYNC_ALL 完成 → 递减计数器 */
 	if (wbc->sync_mode == WB_SYNC_ALL)
 		atomic_dec(&sbi->wb_sync_req[DATA]);
 	/*
 	 * if some pages were truncated, we cannot guarantee its mapping->host
 	 * to detect pending bios.
 	 */
-
+	/* 13. 清除 inode 的 DIRTY 标记（内部判断）*/
 	f2fs_remove_dirty_inode(inode);
 	return ret;
 
 skip_write:
+	/* 14. 跳过场景：把本 inode 脏页数累加到 wbc->pages_skipped */
 	wbc->pages_skipped += get_dirty_pages(inode);
 	trace_f2fs_writepages(mapping->host, wbc, DATA);
 	return 0;
 }
 
+/*
+ * 内核回写子系统回调 → 把 inode 的 DATA 脏页刷盘
+ * 区别：CP 期间由内核线程 current 调用，其余时刻由 flusher 线程调用
+ */
 static int f2fs_write_data_pages(struct address_space *mapping,
 			    struct writeback_control *wbc)
 {
-	struct inode *inode = mapping->host;
+	struct inode *inode = mapping->host;	 /* 拿到 inode */
 
+	/* 选择 I/O 类型：
+	 * 1. CP 期间 → FS_CP_DATA_IO（原地写，不移动日志）
+	 * 2. 普通回写 → FS_DATA_IO（正常日志写）
+	 */
 	return __f2fs_write_data_pages(mapping, wbc,
 			F2FS_I(inode)->cp_task == current ?
 			FS_CP_DATA_IO : FS_DATA_IO);

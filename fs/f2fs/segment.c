@@ -2598,45 +2598,48 @@ static void update_sit_entry(struct f2fs_sb_info *sbi, block_t blkaddr, int del)
 		get_sec_entry(sbi, segno)->valid_blocks += del;
 }
 
+// 把一段连续块标记为无效并更新 SIT:跨几段就减几次有效块，段段进脏链，全程 sentry 锁护体。
 void f2fs_invalidate_blocks(struct f2fs_sb_info *sbi, block_t addr,
 				unsigned int len)
 {
-	unsigned int segno = GET_SEGNO(sbi, addr);
-	struct sit_info *sit_i = SIT_I(sbi);
-	block_t addr_start = addr, addr_end = addr + len - 1;
-	unsigned int seg_num = GET_SEGNO(sbi, addr_end) - segno + 1;
+	unsigned int segno = GET_SEGNO(sbi, addr);	/* 起始段号 */
+	struct sit_info *sit_i = SIT_I(sbi);	/* SIT 全局结构 */
+	block_t addr_start = addr, addr_end = addr + len - 1;	/* 起止块号 */
+	unsigned int seg_num = GET_SEGNO(sbi, addr_end) - segno + 1;	/* 跨段数量 */
 	unsigned int i = 1, max_blocks = sbi->blocks_per_seg, cnt;
 
-	f2fs_bug_on(sbi, addr == NULL_ADDR);
-	if (addr == NEW_ADDR || addr == COMPRESS_ADDR)
+	f2fs_bug_on(sbi, addr == NULL_ADDR);	/* 空地址直接宕机 */
+	if (addr == NEW_ADDR || addr == COMPRESS_ADDR)	/* 尚未分配或压缩占位，无需处理 */
 		return;
 
-	f2fs_invalidate_internal_cache(sbi, addr, len);
+	f2fs_invalidate_internal_cache(sbi, addr, len);	/* 清内部缓存 */
 
 	/* add it into sit main buffer */
-	down_write(&sit_i->sentry_lock);
+	down_write(&sit_i->sentry_lock);	/* 进入 SIT 临界区 */
 
+	/* 先算第一段要处理的块数 */
 	if (seg_num == 1)
 		cnt = len;
 	else
 		cnt = max_blocks - GET_BLKOFF_FROM_SEG0(sbi, addr);
 
 	do {
-		update_segment_mtime(sbi, addr_start, 0);
-		update_sit_entry(sbi, addr_start, -cnt);
+		update_segment_mtime(sbi, addr_start, 0);	/* 更新段修改时间 */
+		update_sit_entry(sbi, addr_start, -cnt);	/* 把 cnt 块从有效计数里减掉 */
 
 		/* add it into dirty seglist */
-		locate_dirty_segment(sbi, segno);
+		locate_dirty_segment(sbi, segno);	/* 把该段加入脏段链表 */
 
 		/* update @addr_start and @cnt and @segno */
+		/* 推进到下一段 */
 		addr_start = START_BLOCK(sbi, ++segno);
-		if (++i == seg_num)
+		if (++i == seg_num)	/* 最后一段 */
 			cnt = GET_BLKOFF_FROM_SEG0(sbi, addr_end) + 1;
 		else
-			cnt = max_blocks;
+			cnt = max_blocks;	/* 中间段，整段处理 */
 	} while (i <= seg_num);
 
-	up_write(&sit_i->sentry_lock);
+	up_write(&sit_i->sentry_lock);	/* 退出临界区 */
 }
 
 bool f2fs_is_checkpointed_data(struct f2fs_sb_info *sbi, block_t blkaddr)
@@ -3997,19 +4000,24 @@ void f2fs_do_write_node_page(unsigned int nid, struct f2fs_io_info *fio)
 	f2fs_update_iostat(fio->sbi, NULL, fio->io_type, F2FS_BLKSIZE);
 }
 
+// 把数据页异地写(out-place)落盘
 void f2fs_outplace_write_data(struct dnode_of_data *dn,
 					struct f2fs_io_info *fio)
 {
-	struct f2fs_sb_info *sbi = fio->sbi;
-	struct f2fs_summary sum;
+	struct f2fs_sb_info *sbi = fio->sbi;	/* 超级块信息 */
+	struct f2fs_summary sum;	/* 用于描述本次写的摘要 */
 
-	f2fs_bug_on(sbi, dn->data_blkaddr == NULL_ADDR);
+	f2fs_bug_on(sbi, dn->data_blkaddr == NULL_ADDR);	/* 必须已有旧地址 */
+	/* 普通数据写或 checkpoint 数据写，顺便更新 extent 年龄缓存 */
 	if (fio->io_type == FS_DATA_IO || fio->io_type == FS_CP_DATA_IO)
 		f2fs_update_age_extent_cache(dn);
+	/* 生成摘要：nid + 节点内偏移 + 版本号 */
 	set_summary(&sum, dn->nid, dn->ofs_in_node, fio->version);
+	/* 真正写页：分配新块、编码、下发 BIO */
 	do_write_page(&sum, fio);
+	/* 把节点页里的块地址更新成刚拿到的新块号 */
 	f2fs_update_data_blkaddr(dn, fio->new_blkaddr);
-
+	/* 统计：按 inode + IO 类型累加写字节数 */
 	f2fs_update_iostat(sbi, dn->inode, fio->io_type, F2FS_BLKSIZE);
 }
 
@@ -4184,40 +4192,49 @@ void f2fs_replace_block(struct f2fs_sb_info *sbi, struct dnode_of_data *dn,
 	f2fs_update_data_blkaddr(dn, new_addr);
 }
 
+// 等一个 folio 写回完成
 void f2fs_folio_wait_writeback(struct folio *folio, enum page_type type,
 		bool ordered, bool locked)
 {
+	/* 只有 folio 正处 WRITEBACK 状态才需要等 */
 	if (folio_test_writeback(folio)) {
 		struct f2fs_sb_info *sbi = F2FS_F_SB(folio);
 
 		/* submit cached LFS IO */
+		/* 先 flush 可能缓存的 LFS 写 */
 		f2fs_submit_merged_write_cond(sbi, NULL, &folio->page, 0, type);
 		/* submit cached IPU IO */
+		/* 再 flush 可能缓存的 IPU 写 */
 		f2fs_submit_merged_ipu_write(sbi, NULL, folio);
 		if (ordered) {
-			folio_wait_writeback(folio);
+			// folio_wait_bit(folio, PG_writeback)
+			folio_wait_writeback(folio);	/* 等 WRITEBACK 结束 */
 			f2fs_bug_on(sbi, locked && folio_test_writeback(folio));
 		} else {
-			folio_wait_stable(folio);
+			folio_wait_stable(folio);	/* 等数据落盘 */
 		}
 	}
 }
 
+// 等待某个数据块写完:GC 需要且地址合法 → 锁住元数据 folio → 等写回 → 放锁走人。
 void f2fs_wait_on_block_writeback(struct inode *inode, block_t blkaddr)
 {
-	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
-	struct folio *cfolio;
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);	/* 取超级块信息 */
+	struct folio *cfolio;	/* 指向元数据映射里的 folio */
 
+	/* 如果当前 inode 不需要 GC 回收元数据，直接返回 */
 	if (!f2fs_meta_inode_gc_required(inode))
 		return;
 
+	/* 如果块地址非法，也直接返回 */
 	if (!__is_valid_data_blkaddr(blkaddr))
 		return;
 
+	/* 根据块号锁住对应的元数据 folio */
 	cfolio = filemap_lock_folio(META_MAPPING(sbi), blkaddr);
-	if (!IS_ERR(cfolio)) {
-		f2fs_folio_wait_writeback(cfolio, DATA, true, true);
-		f2fs_folio_put(cfolio, true);
+	if (!IS_ERR(cfolio)) {	/* 上锁成功 */
+		f2fs_folio_wait_writeback(cfolio, DATA, true, true);	/* 等它写完 */
+		f2fs_folio_put(cfolio, true);	/* 解锁并释放引用 */
 	}
 }
 
@@ -4496,26 +4513,37 @@ void f2fs_write_node_summaries(struct f2fs_sb_info *sbi, block_t start_blk)
 	write_normal_summaries(sbi, start_blk, CURSEG_HOT_NODE);
 }
 
+// 在当前 checkpoint 的 journal 段里查找/追加一条 NAT/SIT 记录
+/*
+ * 在当前 checkpoint 的 journal 区域里查找指定 val（nid 或 segno）：
+ * - 找到 → 返回下标；
+ * - 没找到且 alloc=true 且有空位 → 追加一条并返回下标；
+ * - 否则返回 -1。
+ */
 int f2fs_lookup_journal_in_cursum(struct f2fs_journal *journal, int type,
 					unsigned int val, int alloc)
 {
 	int i;
 
 	if (type == NAT_JOURNAL) {
+		/* 1. 在 NAT journal 里顺序查找指定 nid */
 		for (i = 0; i < nats_in_cursum(journal); i++) {
 			if (le32_to_cpu(nid_in_journal(journal, i)) == val)
-				return i;
+				return i;	/* 找到返回下标 */
 		}
+		/* 2. 没找到且允许分配且有空位 → 追加一条 NAT 记录 */
 		if (alloc && __has_cursum_space(journal, 1, NAT_JOURNAL))
-			return update_nats_in_cursum(journal, 1);
+			return update_nats_in_cursum(journal, 1);	/* 返回新下标 */
 	} else if (type == SIT_JOURNAL) {
+		/* 3. 在 SIT journal 里顺序查找指定 segno */
 		for (i = 0; i < sits_in_cursum(journal); i++)
 			if (le32_to_cpu(segno_in_journal(journal, i)) == val)
-				return i;
+				return i;	/* 找到返回下标 */
+		/* 4. 没找到且允许分配且有空位 → 追加一条 SIT 记录 */
 		if (alloc && __has_cursum_space(journal, 1, SIT_JOURNAL))
-			return update_sits_in_cursum(journal, 1);
+			return update_sits_in_cursum(journal, 1);	/* 返回新下标 */
 	}
-	return -1;
+	return -1;	/* 没找到且不能追加 → 返回 -1 */
 }
 
 static struct folio *get_current_sit_folio(struct f2fs_sb_info *sbi,

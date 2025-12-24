@@ -1018,14 +1018,17 @@ struct dnode_of_data {
 	block_t	data_blkaddr;		/* block address of the node block */
 };
 
+// “初始化一个空的 dnode_of_data 结构” 的 内联工具函数：
+// “把 dnode 所有字段清零，然后填上 inode、folio、nid 三个关键指针，为后续块地址读写做准备。”
 static inline void set_new_dnode(struct dnode_of_data *dn, struct inode *inode,
 		struct folio *ifolio, struct folio *nfolio, nid_t nid)
 {
-	memset(dn, 0, sizeof(*dn));
-	dn->inode = inode;
-	dn->inode_folio = ifolio;
-	dn->node_folio = nfolio;
-	dn->nid = nid;
+	memset(dn, 0, sizeof(*dn));	/* 清零整个结构 */
+	/* 填上三个关键指针 */
+	dn->inode = inode;	/* 所属文件 inode */
+	dn->inode_folio = ifolio;	/* inode 所在的 folio（可为 NULL）*/
+	dn->node_folio = nfolio;	/* node 页所在的 folio（可为 NULL）*/
+	dn->nid = nid;	/* 当前 node 的 nid */
 }
 
 /*
@@ -2339,10 +2342,15 @@ static inline bool __exist_node_summaries(struct f2fs_sb_info *sbi)
 /*
  * Check whether the inode has blocks or not
  */
+// 快速判断 inode 是否拥有除扩展属性块以外的数据块:总块数扣掉 xattr 块，剩余 > 0 即表示有数据。
+/*
+ * 判断 inode 是否真正持有数据块（不含扩展属性块）
+ */
 static inline int F2FS_HAS_BLOCKS(struct inode *inode)
 {
+	/* 1. 若存在扩展属性，则预留 1 个块用于 xattr node */
 	block_t xattr_block = F2FS_I(inode)->i_xattr_nid ? 1 : 0;
-
+	/* 2. 总块数（以 F2FS 块为单位）减去 xattr 块后 > 0 → 有数据块 */
 	return (inode->i_blocks >> F2FS_LOG_SECTORS_PER_BLOCK) > xattr_block;
 }
 
@@ -2839,32 +2847,57 @@ static inline s64 valid_inode_count(struct f2fs_sb_info *sbi)
 	return percpu_counter_sum_positive(&sbi->total_valid_inode_count);
 }
 
+// 用于从页缓存（page cache）中获取一个 folio
+// mapping：指向 inode 的 address_space 结构，管理该文件的页缓存。
+// index：页在文件中的偏移（以页为单位）。
+// for_write：是否用于写操作（影响加锁、标记行为及内存分配策略）。
 static inline struct folio *f2fs_grab_cache_folio(struct address_space *mapping,
 		pgoff_t index, bool for_write)
 {
 	struct folio *folio;
 	unsigned int flags;
 
+	// 第一部分：故障注入（Fault Injection）
+	// 如果启用了 F2FS 故障注入（用于测试异常路径），则：
 	if (IS_ENABLED(CONFIG_F2FS_FAULT_INJECTION)) {
 		fgf_t fgf_flags;
 
+		// 根据 for_write 设置不同的标志：
 		if (!for_write)
+			// 读操作：请求 folio 时加锁（FGP_LOCK）并标记为已访问（FGP_ACCESSED）。
 			fgf_flags = FGP_LOCK | FGP_ACCESSED;
 		else
-			fgf_flags = FGP_LOCK;
+			fgf_flags = FGP_LOCK;	// 写操作：只加锁。
+		// 调用 __filemap_get_folio() 尝试获取 folio。
+		// 如果成功（非错误指针），直接返回。
 		folio = __filemap_get_folio(mapping, index, fgf_flags, 0);
 		if (!IS_ERR(folio))
 			return folio;
 
+		// 如果失败，并且当前“应该”触发 PAGE_ALLOC 故障（通过 time_to_inject() 判断），
+		// 则人为返回 -ENOMEM 错误，模拟内存分配失败。
 		if (time_to_inject(F2FS_M_SB(mapping), FAULT_PAGE_ALLOC))
 			return ERR_PTR(-ENOMEM);
 	}
 
-	if (!for_write)
+	// 第二部分：正常路径（无故障注入 或 故障注入未触发）
+	if (!for_write)	// 情况 1：非写操作（!for_write）
+		// 直接调用通用 VFS 函数 filemap_grab_folio()，它会：
+		// 查找或分配 folio，
+		// 加锁，
+		// 若 folio 不存在则从磁盘读入（但这里不涉及写，所以不会修改内容）。
 		return filemap_grab_folio(mapping, index);
 
+	// 情况 2：写操作（for_write == true）
+	// 临时禁止使用 NOFS（No Filesystem reclaim）上下文进行内存分配。
+	// 防止在文件系统内部进行内存分配时触发递归的文件系统回写（reclaim），避免死锁。
 	flags = memalloc_nofs_save();
+	// FGP_WRITEBEGIN：表示这是为写操作准备的, folio内核会：
+	// 确保 folio 存在（若不存在则分配），
+	// 加锁，
+	// 如果是新分配的 folio，可能需要清零或从磁盘读取（取决于是否是稀疏文件等）。
 	folio = __filemap_get_folio(mapping, index, FGP_WRITEBEGIN,
+			// mapping_gfp_mask(mapping)：使用该 address_space 定义的 GFP 分配标志（通常是 GFP_NOFS 或类似）。
 			mapping_gfp_mask(mapping));
 	memalloc_nofs_restore(flags);
 
@@ -3018,38 +3051,70 @@ static inline bool IS_INODE(struct page *page)
 	return RAW_IS_INODE(p);
 }
 
+// 计算 inode 区域内块地址数组的基偏移（以 __le32 为单位）
+/*
+ * 计算 inode 区域内块地址数组的基偏移（以 __le32 为单位）。
+ * 若启用了 F2FS_EXTRA_ATTR → 返回 extra-isize 除以 4（跳过额外属性区）；
+ * 否则返回 0（i_addr[] 紧贴 inode 头）。
+ */
 static inline int offset_in_addr(struct f2fs_inode *i)
 {
 	return (i->i_inline & F2FS_EXTRA_ATTR) ?
 			(le16_to_cpu(i->i_extra_isize) / sizeof(__le32)) : 0;
 }
 
+// 拿到 node 页内块地址数组的首指针
+/*
+ * 返回 node 页内【块地址数组】的首指针（__le32 *）。
+ * 如果是 inode 页 → 返回 i.i_addr[]；
+ * 如果是 node 页 → 返回 dn.addr[]。
+ */
 static inline __le32 *blkaddr_in_node(struct f2fs_node *node)
 {
 	return RAW_IS_INODE(node) ? node->i.i_addr : node->dn.addr;
 }
 
 static inline int f2fs_has_extra_attr(struct inode *inode);
+
+// 计算 inode 区域内块地址数组的基偏移
+/*
+ * 计算 inode 区域内块地址数组的基偏移（以 __le32 为单位）。
+ * 非 inode 页 → 返回 0（direct/indirect node 无额外偏移）；
+ * inode 页 → 跳过 extra-isize 区域，指向 i_addr[] 起点。
+ */
 static inline unsigned int get_dnode_base(struct inode *inode,
 					struct page *node_page)
 {
-	if (!IS_INODE(node_page))
+	if (!IS_INODE(node_page))	/* 若不是 inode 页 → 无额外偏移，直接返回 0*/
 		return 0;
 
+	/* 若有 inode 结构 → 用运行时 extra-isize；否则用页内记录值*/
 	return inode ? get_extra_isize(inode) :
 			offset_in_addr(&F2FS_NODE(node_page)->i);
 }
 
+// 拿到 node 页内块地址数组的首指针:数组首指针 = 页内数组起点 + inode/direct/indirect 基偏移。
+/*
+ * 返回 node 页内【块地址数组】的首指针（__le32 *）。
+ * 页必须已是 uptodate 且锁定。
+ */
 static inline __le32 *get_dnode_addr(struct inode *inode,
 					struct folio *node_folio)
 {
-	return blkaddr_in_node(F2FS_NODE(&node_folio->page)) +
-			get_dnode_base(inode, &node_folio->page);
+	return blkaddr_in_node(F2FS_NODE(&node_folio->page)) +	/* 数组起始位置 */
+			get_dnode_base(inode, &node_folio->page);	/* inode/direct/indirect 基偏移 */
 }
 
+// 从 node 页里取出指定偏移的块地址
+/*
+ * 从 node 页中取出第 offset 个数据块地址（little-endian → CPU）。
+ * node_folio 必须已是 uptodate 且锁定。
+ */
 static inline block_t data_blkaddr(struct inode *inode,
 			struct folio *node_folio, unsigned int offset)
 {
+	/* 取 node 页内地址数组首指针，再偏移 offset，小端转 CPU*/
+	// 取地址数组首指针 + 偏移，小端转 CPU，返回块地址
 	return le32_to_cpu(*(get_dnode_addr(inode, node_folio) + offset));
 }
 
@@ -3591,12 +3656,14 @@ static inline void verify_blkaddr(struct f2fs_sb_info *sbi,
 			 blkaddr, type);
 }
 
+// 判断一个块地址是不是真正可用的数据块
 static inline bool __is_valid_data_blkaddr(block_t blkaddr)
 {
+	/* 这仨都是“虚地址”，磁盘上并没有真实物理块 */
 	if (blkaddr == NEW_ADDR || blkaddr == NULL_ADDR ||
 			blkaddr == COMPRESS_ADDR)
-		return false;
-	return true;
+		return false;	/* 不是有效数据块 */
+	return true;	/* 其余值才对应真正的物理块号 */
 }
 
 /*
@@ -4421,8 +4488,12 @@ static inline bool f2fs_used_in_atomic_write(struct inode *inode)
 	return f2fs_is_atomic_file(inode) || f2fs_is_cow_file(inode);
 }
 
+// 需要把 inode 的元数据页拉回内存供 GC 处理
 static inline bool f2fs_meta_inode_gc_required(struct inode *inode)
 {
+	/* 只要满足任一条件，就必须把该 inode 的元数据页留在内存，供后续 GC 使用 */
+	/* 需要事后读修复 */
+	/* 正在原子写区间使用 */
 	return f2fs_post_read_required(inode) || f2fs_used_in_atomic_write(inode);
 }
 
@@ -4505,12 +4576,13 @@ void f2fs_invalidate_compress_pages(struct f2fs_sb_info *sbi, nid_t ino);
 	} while (0)
 #else
 static inline bool f2fs_is_compressed_page(struct page *page) { return false; }
+// 压缩后端是否就绪
 static inline bool f2fs_is_compress_backend_ready(struct inode *inode)
 {
-	if (!f2fs_compressed_file(inode))
+	if (!f2fs_compressed_file(inode))	/* 文件没开压缩 → 直接算“就绪” */
 		return true;
 	/* not support compression */
-	return false;
+	return false;	/* 只要开了压缩就返回 false，表示当前*不支持*压缩后端 */
 }
 static inline bool f2fs_is_compress_level_valid(int alg, int lvl) { return false; }
 static inline struct folio *f2fs_compress_control_folio(struct folio *folio)
@@ -4757,23 +4829,27 @@ static inline bool f2fs_may_compress(struct inode *inode)
 	return S_ISREG(inode->i_mode) || S_ISDIR(inode->i_mode);
 }
 
+// 更新 inode 的『压缩节省块数』计数
 static inline void f2fs_i_compr_blocks_update(struct inode *inode,
 						u64 blocks, bool add)
 {
 	struct f2fs_inode_info *fi = F2FS_I(inode);
+	/* diff = 簇大小 - 实际占用子块数 = 本簇节省的块数 */
 	int diff = fi->i_cluster_size - blocks;
 
 	/* don't update i_compr_blocks if saved blocks were released */
+	/* 如果是“减法”且之前已 release（计数为0），说明节省块已失效，不再减 */
 	if (!add && !atomic_read(&fi->i_compr_blocks))
 		return;
 
 	if (add) {
-		atomic_add(diff, &fi->i_compr_blocks);
-		stat_add_compr_blocks(inode, diff);
+		atomic_add(diff, &fi->i_compr_blocks);	/* 累加节省块数 */
+		stat_add_compr_blocks(inode, diff);	/* 更新全局统计 */
 	} else {
-		atomic_sub(diff, &fi->i_compr_blocks);
+		atomic_sub(diff, &fi->i_compr_blocks);	/* 回滚节省块数 */
 		stat_sub_compr_blocks(inode, diff);
 	}
+	/* 标记 inode 脏，确保超级块检查点能持久化新值 */
 	f2fs_mark_inode_dirty_sync(inode, true);
 }
 

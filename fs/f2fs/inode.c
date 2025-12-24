@@ -133,54 +133,79 @@ static bool f2fs_enable_inode_chksum(struct f2fs_sb_info *sbi, struct page *page
 	return true;
 }
 
+// 为 inode node 页计算 CRC32 校验和
+// “先算 inode 号+世代号，再算 inode 前部，用 0 跳过校验和字段，再算后部，返回 CRC32。”
+/*
+ * 计算整个 inode 区域的 CRC32 校验和（不含 i_inode_checksum 字段本身）。
+ * 返回 32 位校验值，供页内对比。
+ */
 static __u32 f2fs_inode_chksum(struct f2fs_sb_info *sbi, struct page *page)
 {
-	struct f2fs_node *node = F2FS_NODE(page);
-	struct f2fs_inode *ri = &node->i;
-	__le32 ino = node->footer.ino;
-	__le32 gen = ri->i_generation;
-	__u32 chksum, chksum_seed;
-	__u32 dummy_cs = 0;
+	struct f2fs_node *node = F2FS_NODE(page);	/* 取出页内 node 结构 */
+	struct f2fs_inode *ri = &node->i;	/* 指向 inode 区域 */
+	__le32 ino = node->footer.ino;	/* 页 footer 中的 inode 号 */
+	__le32 gen = ri->i_generation;	/* inode 世代号 */
+	__u32 chksum, chksum_seed;	/* 累加校验值 / 种子 */
+	__u32 dummy_cs = 0;	/* 用于跳过校验和字段本身 */
+	/* 校验和字段起始 */
 	unsigned int offset = offsetof(struct f2fs_inode, i_inode_checksum);
-	unsigned int cs_size = sizeof(dummy_cs);
+	unsigned int cs_size = sizeof(dummy_cs);	/* 校验和字段长度 */
 
+	/* 1. 用超级块种子 + inode 号 初始化 CRC32 */
 	chksum = f2fs_chksum(sbi->s_chksum_seed, (__u8 *)&ino, sizeof(ino));
+	/* 2. 用 inode 世代号 更新种子（防止重放攻击）*/
 	chksum_seed = f2fs_chksum(chksum, (__u8 *)&gen, sizeof(gen));
 
+	/* 3. 计算 inode 区域【前部】（到校验和字段之前）*/
 	chksum = f2fs_chksum(chksum_seed, (__u8 *)ri, offset);
+	/* 4. 用 0 填充【校验和字段本身】（跳过不参与计算）*/
 	chksum = f2fs_chksum(chksum, (__u8 *)&dummy_cs, cs_size);
+	/* 5. 计算 inode 区域【后部】（校验和字段之后到页尾）*/
 	offset += cs_size;
 	chksum = f2fs_chksum(chksum, (__u8 *)ri + offset,
 			     F2FS_BLKSIZE - offset);
+	/* 6. 返回最终 CRC32 值（与页内保存值比对）*/
 	return chksum;
 }
 
+// 校验 inode node 页的 checksum” 以及 “特殊情况下跳过校验”。
+/*
+ * 校验 inode node 页的 checksum（footer 中的 i_inode_checksum 字段）
+ * 返回 true 表示校验通过；false 表示校验失败（并打印警告）。
+ */
 bool f2fs_inode_chksum_verify(struct f2fs_sb_info *sbi, struct folio *folio)
 {
-	struct f2fs_inode *ri;
-	__u32 provided, calculated;
+	struct f2fs_inode *ri;	/* 指向 node 页中的 inode 区域 */
+	__u32 provided, calculated;	/* 页内保存的校验和 vs. 重新计算的校验和 */
 
+	/* 1. 若文件系统正在关机 → 跳过校验（避免死锁）*/
 	if (unlikely(is_sbi_flag_set(sbi, SBI_IS_SHUTDOWN)))
 		return true;
 
 #ifdef CONFIG_F2FS_CHECK_FS
+	/* 2. 启用严格校验模式：只在校验和功能开启且页干净时才校验 */
 	if (!f2fs_enable_inode_chksum(sbi, &folio->page))
 #else
+	/* 3. 普通模式：只要页脏或正在写回 → 跳过校验（数据未稳定）*/
 	if (!f2fs_enable_inode_chksum(sbi, &folio->page) ||
 			folio_test_dirty(folio) ||
 			folio_test_writeback(folio))
 #endif
-		return true;
+		return true;	/* 跳过校验 → 视为通过 */
 
+	/* 4. 取出页内保存的校验和（小端）*/
 	ri = &F2FS_NODE(&folio->page)->i;
 	provided = le32_to_cpu(ri->i_inode_checksum);
+	/* 5. 重新计算整个 inode 区域的 CRC32 校验和*/
 	calculated = f2fs_inode_chksum(sbi, &folio->page);
 
+	/* 6. 若不一致 → 打印警告（带 nid 和 ino_of_node）*/
 	if (provided != calculated)
 		f2fs_warn(sbi, "checksum invalid, nid = %lu, ino_of_node = %x, %x vs. %x",
 			  folio->index, ino_of_node(&folio->page),
 			  provided, calculated);
 
+	/* 7. 返回校验结果（相等为 true）*/
 	return provided == calculated;
 }
 

@@ -30,16 +30,24 @@ static struct kmem_cache *fsync_node_entry_slab;
 /*
  * Check whether the given nid is within node id range.
  */
+// 检查一个 nid 是否越界” 以及越界时的处理流程。
+/*
+ * 检查给定 nid 是否超出 node id 有效范围。
+ * 若越界则标记需要 fsck，并上报错误。
+ */
 int f2fs_check_nid_range(struct f2fs_sb_info *sbi, nid_t nid)
 {
+	/* 若 nid 小于根 inode 号或大于最大可用 nid → 越界 */
 	if (unlikely(nid < F2FS_ROOT_INO(sbi) || nid >= NM_I(sbi)->max_nid)) {
-		set_sbi_flag(sbi, SBI_NEED_FSCK);
+		set_sbi_flag(sbi, SBI_NEED_FSCK);	/* 标记超级块：需要运行 fsck 修复 */
+		/* 打印警告信息 */
 		f2fs_warn(sbi, "%s: out-of-range nid=%x, run fsck to fix.",
 			  __func__, nid);
+		/* 触发错误处理流程（通常记录错误位并设置只读）*/
 		f2fs_handle_error(sbi, ERROR_CORRUPTED_INODE);
-		return -EFSCORRUPTED;
+		return -EFSCORRUPTED;	/* 返回文件系统损坏错误码 */
 	}
-	return 0;
+	return 0;	/* 在范围内 → 返回 0（成功）*/
 }
 
 bool f2fs_available_free_memory(struct f2fs_sb_info *sbi, int type)
@@ -164,18 +172,23 @@ static struct page *get_next_nat_page(struct f2fs_sb_info *sbi, nid_t nid)
 	return &dst_folio->page;
 }
 
+// 从 slab 分配一条 nat_entry 并初始化
+/*
+ * 从 nat_entry_slab 分配一条新的 nat_entry 结构，
+ * 初始化 nid 和标志位，失败时根据 no_fail 决定是否 panic。
+ */
 static struct nat_entry *__alloc_nat_entry(struct f2fs_sb_info *sbi,
 						nid_t nid, bool no_fail)
 {
 	struct nat_entry *new;
-
+	/* 从 per-memcg slab 分配，清零，no_fail=true 时失败会 panic */
 	new = f2fs_kmem_cache_alloc(nat_entry_slab,
 					GFP_F2FS_ZERO, no_fail, sbi);
 	if (new) {
-		nat_set_nid(new, nid);
-		nat_reset_flag(new);
+		nat_set_nid(new, nid);	/* 填写 nid */
+		nat_reset_flag(new);	/* 清除所有标志位（IS_DIRTY 等）*/
 	}
-	return new;
+	return new;	/* 成功返回指针，失败返回 NULL*/
 }
 
 static void __free_nat_entry(struct nat_entry *e)
@@ -184,41 +197,56 @@ static void __free_nat_entry(struct nat_entry *e)
 }
 
 /* must be locked by nat_tree_lock */
+// 把一条 nat_entry 插入 radix-tree + LRU，并可选填充原始 NAT 内容
+/*
+ * 必须在持有 nat_tree_lock 写锁的情况下调用！
+ * 将一条已分配的 nat_entry 插入 radix-tree 和 LRU，
+ * 若提供了原始 NAT 内容则填充，并更新计数器。
+ */
 static struct nat_entry *__init_nat_entry(struct f2fs_nm_info *nm_i,
 	struct nat_entry *ne, struct f2fs_nat_entry *raw_ne, bool no_fail)
 {
-	if (no_fail)
+	if (no_fail)	/* 1. 插入 radix-tree：no_fail=true 时失败会 panic，否则返回 NULL*/
 		f2fs_radix_tree_insert(&nm_i->nat_root, nat_get_nid(ne), ne);
 	else if (radix_tree_insert(&nm_i->nat_root, nat_get_nid(ne), ne))
-		return NULL;
+		return NULL;	/* 插入失败 → 返回 NULL*/
 
-	if (raw_ne)
+	if (raw_ne)	/* 2. 若提供了原始 NAT 内容 → 填充到 ne->ni（node_info）*/
 		node_info_from_raw_nat(&ne->ni, raw_ne);
-
+	/* 3. 挂到 LRU 尾部（recent-access 顺序）*/
 	spin_lock(&nm_i->nat_list_lock);
 	list_add_tail(&ne->list, &nm_i->nat_entries);
 	spin_unlock(&nm_i->nat_list_lock);
 
+	/* 4. 更新计数器：总 NAT 数 + 可回收 NAT 数*/
 	nm_i->nat_cnt[TOTAL_NAT]++;
 	nm_i->nat_cnt[RECLAIMABLE_NAT]++;
-	return ne;
+	return ne;	 /* 返回插入成功的 entry*/
 }
 
+// 在 NAT 缓存中查找一条 entry，并把最近访问的干净 entry 移到 LRU 尾部
+/*
+ * 在 NAT 缓存（radix-tree + LRU）中查找指定 nid 的 nat_entry。
+ * 若找到且是干净 entry，则把它移到 LRU 尾部（recent-access 优化）。
+ */
 static struct nat_entry *__lookup_nat_cache(struct f2fs_nm_info *nm_i, nid_t n)
 {
 	struct nat_entry *ne;
 
+	/* 1. 用 radix-tree 快速查找 */
 	ne = radix_tree_lookup(&nm_i->nat_root, n);
 
 	/* for recent accessed nat entry, move it to tail of lru list */
+	/* 2. 若找到且是干净（非 DIRTY）→ 移到 LRU 尾部（recent 优化）*/
 	if (ne && !get_nat_flag(ne, IS_DIRTY)) {
 		spin_lock(&nm_i->nat_list_lock);
+		/* 只在已挂 LRU 时才移动（头→尾）*/
 		if (!list_empty(&ne->list))
 			list_move_tail(&ne->list, &nm_i->nat_entries);
 		spin_unlock(&nm_i->nat_list_lock);
 	}
 
-	return ne;
+	return ne;	/* 返回找到的 entry，NULL 表示未命中 */
 }
 
 static unsigned int __gang_lookup_nat_cache(struct f2fs_nm_info *nm_i,
@@ -425,6 +453,12 @@ bool f2fs_need_inode_block_update(struct f2fs_sb_info *sbi, nid_t ino)
 }
 
 /* must be locked by nat_tree_lock */
+// 把一条 NAT 修改缓存到内存
+/*
+ * 必须在持有 nat_tree_lock 写锁的情况下调用！
+ * 将一条新的 NAT 条目（nid + ne）缓存到内存 radix-tree + LRU，
+ * 若已存在则断言内容必须一致。
+ */
 static void cache_nat_entry(struct f2fs_sb_info *sbi, nid_t nid,
 						struct f2fs_nat_entry *ne)
 {
@@ -432,24 +466,27 @@ static void cache_nat_entry(struct f2fs_sb_info *sbi, nid_t nid,
 	struct nat_entry *new, *e;
 
 	/* Let's mitigate lock contention of nat_tree_lock during checkpoint */
+	/* 若正在 checkpoint，直接退出，避免锁竞争（CP 会批量处理）*/
 	if (f2fs_rwsem_is_locked(&sbi->cp_global_sem))
 		return;
 
+	/* 1. 从 slab 分配一条新的 nat_entry（不填充内容）*/
 	new = __alloc_nat_entry(sbi, nid, false);
 	if (!new)
 		return;
-
+	/* 2. 加写锁，进入临界区 */
 	f2fs_down_write(&nm_i->nat_tree_lock);
+	/* 3. 在 radix-tree 中查找是否已存在 */
 	e = __lookup_nat_cache(nm_i, nid);
-	if (!e)
+	if (!e)	/* 4. 不存在 → 初始化新 entry 并插入树 + LRU */
 		e = __init_nat_entry(nm_i, new, ne, false);
-	else
+	else	/* 5. 已存在 → 断言内容必须完全一致（防腐败）*/
 		f2fs_bug_on(sbi, nat_get_ino(e) != le32_to_cpu(ne->ino) ||
 				nat_get_blkaddr(e) !=
 					le32_to_cpu(ne->block_addr) ||
 				nat_get_version(e) != ne->version);
-	f2fs_up_write(&nm_i->nat_tree_lock);
-	if (e != new)
+	f2fs_up_write(&nm_i->nat_tree_lock);	/* 6. 退出临界区 */
+	if (e != new)	/* 7. 若复用了旧 entry，则释放本次分配的新 entry */
 		__free_nat_entry(new);
 }
 
@@ -543,6 +580,15 @@ int f2fs_try_to_free_nats(struct f2fs_sb_info *sbi, int nr_shrink)
 	return nr - nr_shrink;
 }
 
+// 用于获取节点（node）元数据信息的核心函数:
+// 它的目标是从 NAT（Node Address Table）中查找指定 nid（node ID）对应的 inode 编号、物理块地址（blk_addr）、版本号等信息，并尽可能利用缓存加速访问。
+// nid：要查询的 node ID。
+// ni：输出结构，用于返回查询结果（ino、blk_addr、version 等）。
+// checkpoint_context：是否在 checkpoint 上下文中调用（影响锁竞争策略）。
+// F2FS 为提升性能，对 NAT 表做了三层缓存/查找：
+// NAT 缓存（nat_entry cache） → 最快
+// 当前 segment 的 journal（日志） → 次快（避免读磁盘）
+// NAT 块（磁盘上的元数据页） → 最慢（需 I/O）
 int f2fs_get_node_info(struct f2fs_sb_info *sbi, nid_t nid,
 				struct node_info *ni, bool checkpoint_context)
 {
@@ -562,10 +608,12 @@ int f2fs_get_node_info(struct f2fs_sb_info *sbi, nid_t nid,
 	ni->nid = nid;
 retry:
 	/* Check nat cache */
-	f2fs_down_read(&nm_i->nat_tree_lock);
-	e = __lookup_nat_cache(nm_i, nid);
+	// 第一部分：检查 NAT 缓存（内存中的 nat_entry）
+	f2fs_down_read(&nm_i->nat_tree_lock);	// 获取 nat_tree_lock（读锁），保护 NAT 缓存树。
+	e = __lookup_nat_cache(nm_i, nid);	// 若在缓存中找到 nid 对应的 nat_entry e，直接填充 ni 并返回。
 	if (e) {
 		ni->ino = nat_get_ino(e);
+		// 块地址
 		ni->blk_addr = nat_get_blkaddr(e);
 		ni->version = nat_get_version(e);
 		f2fs_up_read(&nm_i->nat_tree_lock);
@@ -578,6 +626,14 @@ retry:
 	 * nat_tree_lock. Therefore, we should retry, if we failed to grab here
 	 * while not bothering checkpoint.
 	 */
+	// 第二部分：尝试从 journal 中查找（避免读磁盘）
+	// 锁竞争处理（关键！）
+	// 目的：避免死锁。
+	// cp_global_sem 是 checkpoint 全局信号量。journal_rwsem 保护当前 segment 的 journal。
+	// 在 checkpoint 过程中，可能已持有 cp_global_sem 并尝试获取 nat_tree_lock。
+	// 策略：如果不在 checkpoint 上下文，且 cp_global_sem 未被持有 → 安全地获取 journal_rwsem。
+	// 否则（可能有锁依赖风险）：
+	// 若 nat_tree_lock 有竞争，或无法立即获取 journal_rwsem → 释放 nat_tree_lock，重试（避免死锁）。
 	if (!f2fs_rwsem_is_locked(&sbi->cp_global_sem) || checkpoint_context) {
 		down_read(&curseg->journal_rwsem);
 	} else if (f2fs_rwsem_is_contended(&nm_i->nat_tree_lock) ||
@@ -586,93 +642,121 @@ retry:
 		goto retry;
 	}
 
+	// 查找 journal
+	// 在当前 hot data segment 的 journal 中查找 NAT 条目。
 	i = f2fs_lookup_journal_in_cursum(journal, NAT_JOURNAL, nid, 0);
+	// 若找到（i >= 0）：
 	if (i >= 0) {
-		ne = nat_in_journal(journal, i);
-		node_info_from_raw_nat(ni, &ne);
+		ne = nat_in_journal(journal, i);	// 提取 ne（raw NAT entry）
+		node_info_from_raw_nat(ni, &ne);	// 转换为 ni
 	}
 	up_read(&curseg->journal_rwsem);
 	if (i >= 0) {
 		f2fs_up_read(&nm_i->nat_tree_lock);
-		goto cache;
+		goto cache;	// 跳转到 cache: 标签（后续会缓存并验证）。
 	}
 
 	/* Fill node_info from nat page */
-	index = current_nat_addr(sbi, nid);
-	f2fs_up_read(&nm_i->nat_tree_lock);
+	// 第三部分：从 NAT 块（磁盘）读取
+	index = current_nat_addr(sbi, nid);	// 计算 nid 所在的 NAT 块的逻辑地址（index）。
+	f2fs_up_read(&nm_i->nat_tree_lock);	// 释放 nat_tree_lock（因为接下来可能阻塞在 I/O 上，不能长时间持锁）。
 
-	folio = f2fs_get_meta_folio(sbi, index);
+	folio = f2fs_get_meta_folio(sbi, index);	//  读取元数据页（可能触发磁盘 I/O）。
 	if (IS_ERR(folio))
 		return PTR_ERR(folio);
 
+	// 从 NAT 块中提取对应 nid 的 entry（注意：一个 NAT 块包含多个 entry，需计算偏移 nid - start_nid）。
 	nat_blk = folio_address(folio);
 	ne = nat_blk->entries[nid - start_nid];
 	node_info_from_raw_nat(ni, &ne);
+	// 使用后释放 folio（true 表示解锁）。
 	f2fs_folio_put(folio, true);
-cache:
+cache:	// 第四部分：验证与缓存
+	// 地址合法性校验：
 	blkaddr = le32_to_cpu(ne.block_addr);
+	// 如果 blkaddr 是有效数据地址（非 NULL/NEW 等）
+	// 则进一步检查是否在设备有效范围内（f2fs_is_valid_blkaddr）。
 	if (__is_valid_data_blkaddr(blkaddr) &&
 		!f2fs_is_valid_blkaddr(sbi, blkaddr, DATA_GENERIC_ENHANCE))
-		return -EFAULT;
+		return -EFAULT;	// 若无效 → 返回 -EFAULT（元数据损坏）。
 
 	/* cache nat entry */
-	cache_nat_entry(sbi, nid, &ne);
+	// 缓存 NAT 条目：
+	cache_nat_entry(sbi, nid, &ne); // 调用 cache_nat_entry() 将刚查到的 ne 加入 NAT 缓存（nat_entry 树）
 	return 0;
 }
 
 /*
  * readahead MAX_RA_NODE number of node pages.
  */
+// 对 parent node 页内的相邻 nid 做预读
+/*
+ * 对 parent node 页内的相邻 nid 做预读（最多 MAX_RA_NODE 页）。
+ * 用于加速 wandering tree 遍历，减少后续读盘延迟。
+ */
 static void f2fs_ra_node_pages(struct folio *parent, int start, int n)
 {
-	struct f2fs_sb_info *sbi = F2FS_F_SB(parent);
-	struct blk_plug plug;
+	struct f2fs_sb_info *sbi = F2FS_F_SB(parent);	/* 超级块信息 */
+	struct blk_plug plug;	/* BIO 合并插头*/
 	int i, end;
 	nid_t nid;
 
+	/* 1. 开始 BIO 合并，减少提交次数*/
 	blk_start_plug(&plug);
 
 	/* Then, try readahead for siblings of the desired node */
+	/* 2. 计算预读范围：start 开始，最多 n 个，不超过每块 NIDS_PER_BLOCK*/
 	end = start + n;
 	end = min(end, (int)NIDS_PER_BLOCK);
+	/* 3. 逐 nid 预读：从 parent 页内取 nid，提交预读 BIO*/
 	for (i = start; i < end; i++) {
-		nid = get_nid(&parent->page, i, false);
-		f2fs_ra_node_page(sbi, nid);
+		nid = get_nid(&parent->page, i, false);	/* 取第 i 个 nid（不创建）*/
+		f2fs_ra_node_page(sbi, nid);	 /* 预读该 nid 对应的 node 页*/
 	}
 
+	/* 4. 结束 BIO 合并，一次性下发到磁盘*/
 	blk_finish_plug(&plug);
 }
 
+// 跳过当前 node 页内剩余槽位，直接算出下一个 node 的起始页号
+// 先算本层跨度，再算基准偏移，最后‘整除+1’对齐到下一个 node 起始页号——三步跳完空洞。
 pgoff_t f2fs_get_next_page_offset(struct dnode_of_data *dn, pgoff_t pgofs)
 {
-	const long direct_index = ADDRS_PER_INODE(dn->inode);
-	const long direct_blks = ADDRS_PER_BLOCK(dn->inode);
-	const long indirect_blks = ADDRS_PER_BLOCK(dn->inode) * NIDS_PER_BLOCK;
-	unsigned int skipped_unit = ADDRS_PER_BLOCK(dn->inode);
-	int cur_level = dn->cur_level;
-	int max_level = dn->max_level;
-	pgoff_t base = 0;
+	/* 各类地址槽常量 */
+	const long direct_index = ADDRS_PER_INODE(dn->inode);	/* inode 内直接指针数 */
+	const long direct_blks = ADDRS_PER_BLOCK(dn->inode);	/* 一级间接块槽数 */
+	const long indirect_blks = ADDRS_PER_BLOCK(dn->inode) * NIDS_PER_BLOCK;	/* 二级间接块槽数 */
+	unsigned int skipped_unit = ADDRS_PER_BLOCK(dn->inode);	/* 本层要跳过的槽位单位 */
+	int cur_level = dn->cur_level;	/* 当前 node 所在间接级别 */
+	int max_level = dn->max_level;	/* 该文件最大间接级别 */
+	pgoff_t base = 0;	/* 已累计的“低级别”槽位总数 */
 
-	if (!dn->max_level)
+	if (!dn->max_level)	/* 只有直接指针 → 下一个就是紧邻页 */
 		return pgofs + 1;
 
-	while (max_level-- > cur_level)
-		skipped_unit *= NIDS_PER_BLOCK;
+	while (max_level-- > cur_level)	/* 2. 由最大级别向下折算到当前级别，得到“本层一个 node 能管多少页” */
+		skipped_unit *= NIDS_PER_BLOCK;	/* 每降一级，槽位跨度 * NIDS_PER_BLOCK */
 
+	/* 3. 根据最大间接级别，累加前面所有级别的总槽数，得到“本层起始页号”基准 */
 	switch (dn->max_level) {
-	case 3:
-		base += 2 * indirect_blks;
+	case 3:	/* 三级间接 */
+		base += 2 * indirect_blks;	/* 两套二级间接块 */
 		fallthrough;
-	case 2:
-		base += 2 * direct_blks;
+	case 2:	/* 二级间接 */
+		base += 2 * direct_blks;	/* 两套一级间接块 */
 		fallthrough;
-	case 1:
-		base += direct_index;
+	case 1:	/* 一级间接 */
+		base += direct_index;	/* inode 内直接指针 */
 		break;
 	default:
 		f2fs_bug_on(F2FS_I_SB(dn->inode), 1);
 	}
 
+	/* 4. 计算“当前 node 块”之后下一个 node 的起始页号：
+	 *   - 先减去基准，得到在本层内的序号
+	 *   - 除以本层一个 node 管理的页数，+1 进到下一个 node
+	 *   - 再乘回去并加回基准，就是下一个 node 的起始页号
+	 */
 	return ((pgofs - base) / skipped_unit + 1) * skipped_unit + base;
 }
 
@@ -680,49 +764,65 @@ pgoff_t f2fs_get_next_page_offset(struct dnode_of_data *dn, pgoff_t pgofs)
  * The maximum depth is four.
  * Offset[0] will have raw inode offset.
  */
+// 把一个文件页号 block（文件内的偏移块） 映射到 wandering tree 的哪一级 node、哪一页、哪一格
+/*
+ * 根据文件页号 block，计算它在 wandering tree 中的「路径」：
+ * 返回需要经过的 node 级数（0-3），并填充 offset[] 和 noffset[] 数组。
+ * 最大深度 = 4 级（inode → direct → indirect → double-indirect）。
+ */
+// noffset 是 “整棵 wandering tree 的全局逻辑序号”
 static int get_node_path(struct inode *inode, long block,
 				int offset[4], unsigned int noffset[4])
 {
-	const long direct_index = ADDRS_PER_INODE(inode);
-	const long direct_blks = ADDRS_PER_BLOCK(inode);
-	const long dptrs_per_blk = NIDS_PER_BLOCK;
-	const long indirect_blks = ADDRS_PER_BLOCK(inode) * NIDS_PER_BLOCK;
-	const long dindirect_blks = indirect_blks * NIDS_PER_BLOCK;
-	int n = 0;
-	int level = 0;
+	/* 每级容量常量（以 block 为单位）*/
+	const long direct_index = ADDRS_PER_INODE(inode);	/* inode 内直接指针数 */
+	const long direct_blks = ADDRS_PER_BLOCK(inode);	/* 每块直接指针数 */
+	const long dptrs_per_blk = NIDS_PER_BLOCK;	/* 每块间接指针数 */
+	const long indirect_blks = ADDRS_PER_BLOCK(inode) * NIDS_PER_BLOCK;	/* 单级间接总容量 */
+	const long dindirect_blks = indirect_blks * NIDS_PER_BLOCK;	/* 双级间接总容量 */
+	int n = 0;	/* offset[] 下标 */
+	int level = 0;	/* 返回的层级（0-3）*/
 
-	noffset[0] = 0;
+	noffset[0] = 0;	/* inode 页内偏移始终为 0 */
 
+	/* 1. 直接落在 inode 内（level 0）*/
 	if (block < direct_index) {
 		offset[n] = block;
 		goto got;
 	}
-	block -= direct_index;
+	/* 2. 落在第 1 个 direct node（level 1）*/
+	block -= direct_index;	 /* 减去 inode 容量 */
 	if (block < direct_blks) {
-		offset[n++] = NODE_DIR1_BLOCK;
-		noffset[n] = 1;
-		offset[n] = block;
+		offset[n++] = NODE_DIR1_BLOCK;	/* node 类型编号 */
+		noffset[n] = 1;	/* 本node 在 wandering tree 中的逻辑偏移 */
+		offset[n] = block;	/* node 内偏移 */
 		level = 1;
 		goto got;
 	}
-	block -= direct_blks;
+
+	/* 3. 落在第 2 个 direct node（level 1）*/
+	block -= direct_blks;	/* 减去第 1 个 direct node 容量 */
 	if (block < direct_blks) {
 		offset[n++] = NODE_DIR2_BLOCK;
-		noffset[n] = 2;
+		noffset[n] = 2;	/* 本node 在 wandering tree 中的逻辑偏移 */
 		offset[n] = block;
 		level = 1;
 		goto got;
 	}
-	block -= direct_blks;
+
+	/* 4. 落在第 1 个 indirect node（level 2）*/
+	block -= direct_blks;	/* 减去第 2 个 direct node 容量 */
 	if (block < indirect_blks) {
-		offset[n++] = NODE_IND1_BLOCK;
-		noffset[n] = 3;
-		offset[n++] = block / direct_blks;
-		noffset[n] = 4 + offset[n - 1];
-		offset[n] = block % direct_blks;
+		offset[n++] = NODE_IND1_BLOCK;	/* 间接 node 类型 */
+		noffset[n] = 3;	/* 本node 在 wandering tree 中的逻辑偏移 */
+		offset[n++] = block / direct_blks;	/* 间接指针格号 */
+		noffset[n] = 4 + offset[n - 1];	/* 本node 在 wandering tree 中的逻辑偏移 */
+		offset[n] = block % direct_blks;	/* 最终直接指针格号 */
 		level = 2;
 		goto got;
 	}
+
+	/* 5. 落在第 2 个 indirect node（level 2）*/
 	block -= indirect_blks;
 	if (block < indirect_blks) {
 		offset[n++] = NODE_IND2_BLOCK;
@@ -733,25 +833,27 @@ static int get_node_path(struct inode *inode, long block,
 		level = 2;
 		goto got;
 	}
+
+	/* 6. 落在 double indirect node（level 3）*/
 	block -= indirect_blks;
 	if (block < dindirect_blks) {
-		offset[n++] = NODE_DIND_BLOCK;
-		noffset[n] = 5 + (dptrs_per_blk * 2);
-		offset[n++] = block / indirect_blks;
+		offset[n++] = NODE_DIND_BLOCK;	/* 双间接 node 类型 */
+		noffset[n] = 5 + (dptrs_per_blk * 2);	/* 本node 在 wandering tree 中的逻辑偏移 */
+		offset[n++] = block / indirect_blks;	/* 一级间接指针格号 */
 		noffset[n] = 6 + (dptrs_per_blk * 2) +
 			      offset[n - 1] * (dptrs_per_blk + 1);
-		offset[n++] = (block / direct_blks) % dptrs_per_blk;
+		offset[n++] = (block / direct_blks) % dptrs_per_blk;	/* 二级间接指针格号 */
 		noffset[n] = 7 + (dptrs_per_blk * 2) +
 			      offset[n - 2] * (dptrs_per_blk + 1) +
 			      offset[n - 1];
-		offset[n] = block % direct_blks;
+		offset[n] = block % direct_blks;	/* 最终直接指针格号 */
 		level = 3;
 		goto got;
 	} else {
-		return -E2BIG;
+		return -E2BIG;	/* 超出双间接容量 → 文件太大 */
 	}
 got:
-	return level;
+	return level;	/* 返回层级（0-3）*/
 }
 
 static struct folio *f2fs_get_node_folio_ra(struct folio *parent, int start);
@@ -761,23 +863,33 @@ static struct folio *f2fs_get_node_folio_ra(struct folio *parent, int start);
  * Also, it should grab and release a rwsem by calling f2fs_lock_op() and
  * f2fs_unlock_op() only if mode is set with ALLOC_NODE.
  */
+// 从 inode 出发，沿着 wandering tree 找到指定索引的 node 页，并返回其块地址
+/*
+ * 根据页索引 index，沿着 wandering tree 找到对应的 node 页，
+ * 并返回该 node 页中保存的块地址。
+ * 调用者必须：
+ *   1. 先调用 f2fs_put_dnode(dn) 释放资源；
+ *   2. 若 mode 包含 ALLOC_NODE，必须先 f2fs_lock/unlock_op()。
+ */
 int f2fs_get_dnode_of_data(struct dnode_of_data *dn, pgoff_t index, int mode)
 {
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dn->inode);
-	struct folio *nfolio[4];
+	struct folio *nfolio[4];	/* 最多 4 级 node 页（inode→direct→indirect→double）*/
 	struct folio *parent = NULL;
-	int offset[4];
-	unsigned int noffset[4];
-	nid_t nids[4];
+	int offset[4];	/* 每级 node 页内的偏移 */
+	unsigned int noffset[4];	/* 每级 node 页内的逻辑偏移 */
+	nid_t nids[4];	/* 每级 node 页的 nid */
 	int level, i = 0;
 	int err = 0;
 
+	/* 1. 根据页号 index 计算需要经过多少级 node 页（0-3）*/
 	level = get_node_path(dn->inode, index, offset, noffset);
 	if (level < 0)
-		return level;
+		return level;	/* 索引越界 */
 
-	nids[0] = dn->inode->i_ino;
+	nids[0] = dn->inode->i_ino;	/* 2. 从 inode 开始（第 0 级）*/
 
+	/* 若调用者没提供 inode_folio，自己去拿；否则直接用传入的 */
 	if (!dn->inode_folio) {
 		nfolio[0] = f2fs_get_inode_folio(sbi, nids[0]);
 		if (IS_ERR(nfolio[0]))
@@ -787,6 +899,7 @@ int f2fs_get_dnode_of_data(struct dnode_of_data *dn, pgoff_t index, int mode)
 	}
 
 	/* if inline_data is set, should not report any block indices */
+	/* 如果文件启用了 inline_data 且 index≠0，直接返回 -ENOENT（无块索引）*/
 	if (f2fs_has_inline_data(dn->inode) && index) {
 		err = -ENOENT;
 		f2fs_folio_put(nfolio[0], true);
@@ -794,15 +907,16 @@ int f2fs_get_dnode_of_data(struct dnode_of_data *dn, pgoff_t index, int mode)
 	}
 
 	parent = nfolio[0];
-	if (level != 0)
+	if (level != 0)	/* 从 inode 页里取出下一级 node 的 nid */
 		nids[1] = get_nid(&parent->page, offset[0], true);
 	dn->inode_folio = nfolio[0];
-	dn->inode_folio_locked = true;
+	dn->inode_folio_locked = true;	/* 标记 inode 页已锁 */
 
 	/* get indirect or direct nodes */
+	/* 3. 逐级向下遍历 node 页（最多 4 级）*/
 	for (i = 1; i <= level; i++) {
 		bool done = false;
-
+		/* 需要分配新 node 页且当前级就是目标级 → 直接 alloc */
 		if (!nids[i] && mode == ALLOC_NODE) {
 			/* alloc new node */
 			if (!f2fs_alloc_nid(sbi, &(nids[i]))) {
@@ -811,16 +925,18 @@ int f2fs_get_dnode_of_data(struct dnode_of_data *dn, pgoff_t index, int mode)
 			}
 
 			dn->nid = nids[i];
+			/* 分配并初始化新 node 页 */
 			nfolio[i] = f2fs_new_node_folio(dn, noffset[i]);
 			if (IS_ERR(nfolio[i])) {
 				f2fs_alloc_nid_failed(sbi, nids[i]);
 				err = PTR_ERR(nfolio[i]);
 				goto release_pages;
 			}
-
+			/* 把新 nid 填到父页，完成 wandering tree 链接 */
 			set_nid(parent, offset[i - 1], nids[i], i == 1);
 			f2fs_alloc_nid_done(sbi, nids[i]);
 			done = true;
+		/* 预读模式：一次性读多个 node 页 */
 		} else if (mode == LOOKUP_NODE_RA && i == level && level > 1) {
 			nfolio[i] = f2fs_get_node_folio_ra(parent, offset[i - 1]);
 			if (IS_ERR(nfolio[i])) {
@@ -829,6 +945,7 @@ int f2fs_get_dnode_of_data(struct dnode_of_data *dn, pgoff_t index, int mode)
 			}
 			done = true;
 		}
+		/* 解锁/释放父页（除第 0 级 inode 外）*/
 		if (i == 1) {
 			dn->inode_folio_locked = false;
 			folio_unlock(parent);
@@ -836,7 +953,7 @@ int f2fs_get_dnode_of_data(struct dnode_of_data *dn, pgoff_t index, int mode)
 			f2fs_folio_put(parent, true);
 		}
 
-		if (!done) {
+		if (!done) {	/* 若未提前完成，正常读 node 页 */
 			nfolio[i] = f2fs_get_node_folio(sbi, nids[i]);
 			if (IS_ERR(nfolio[i])) {
 				err = PTR_ERR(nfolio[i]);
@@ -844,16 +961,20 @@ int f2fs_get_dnode_of_data(struct dnode_of_data *dn, pgoff_t index, int mode)
 				goto release_out;
 			}
 		}
+		/* 还没到最底层 → 继续取下一级 nid */
 		if (i < level) {
 			parent = nfolio[i];
 			nids[i + 1] = get_nid(&parent->page, offset[i], false);
 		}
 	}
+
+	/* 4. 到达最底层，填充 dn 结构 */
 	dn->nid = nids[level];
 	dn->ofs_in_node = offset[level];
 	dn->node_folio = nfolio[level];
-	dn->data_blkaddr = f2fs_data_blkaddr(dn);
+	dn->data_blkaddr = f2fs_data_blkaddr(dn);	/* 取出块地址 */
 
+	/* 5. 压缩文件 + 只读挂载 → 更新 extent cache（快速读）*/
 	if (is_inode_flag_set(dn->inode, FI_COMPRESSED_FILE) &&
 					f2fs_sb_has_readonly(sbi)) {
 		unsigned int cluster_size = F2FS_I(dn->inode)->i_cluster_size;
@@ -863,26 +984,31 @@ int f2fs_get_dnode_of_data(struct dnode_of_data *dn, pgoff_t index, int mode)
 		block_t blkaddr;
 
 		/* should align fofs and ofs_in_node to cluster_size */
+		/* 对齐到 16 页边界 */
 		if (fofs % cluster_size) {
 			fofs = round_down(fofs, cluster_size);
 			ofs_in_node = round_down(ofs_in_node, cluster_size);
 		}
 
+		/* 检查 16 页是否连续 */
 		c_len = f2fs_cluster_blocks_are_contiguous(dn, ofs_in_node);
 		if (!c_len)
 			goto out;
 
+		/* 取首块地址 */
 		blkaddr = data_blkaddr(dn->inode, dn->node_folio, ofs_in_node);
 		if (blkaddr == COMPRESS_ADDR)
 			blkaddr = data_blkaddr(dn->inode, dn->node_folio,
 						ofs_in_node + 1);
 
+		/* 更新 extent cache，供后续快速读 */
 		f2fs_update_read_extent_tree_range_compressed(dn->inode,
 					fofs, blkaddr, cluster_size, c_len);
 	}
 out:
-	return 0;
+	return 0;	/* 成功返回 0 */
 
+/* ===== 错误清理路径 ===== */
 release_pages:
 	f2fs_folio_put(parent, true);
 	if (i > 1)
@@ -898,17 +1024,19 @@ release_out:
 	return err;
 }
 
+// 彻底回收一个 node 页（含 nid → NULL_ADDR 及缓存清理）
+// 读 NAT→失效块→清 NAT→减计数→清缓存
 static int truncate_node(struct dnode_of_data *dn)
 {
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dn->inode);
-	struct node_info ni;
+	struct node_info ni;	/* 该 node 的 NAT 信息 */
 	int err;
 	pgoff_t index;
-
+	/* 1. 读出 NAT 条目（nid → blk_addr）*/
 	err = f2fs_get_node_info(sbi, dn->nid, &ni, false);
 	if (err)
 		return err;
-
+	/* 2. NAT 地址合法性检查，非法则标腐败并返回 */
 	if (ni.blk_addr != NEW_ADDR &&
 		!f2fs_is_valid_blkaddr(sbi, ni.blk_addr, DATA_GENERIC_ENHANCE)) {
 		f2fs_err_ratelimited(sbi,
@@ -920,47 +1048,57 @@ static int truncate_node(struct dnode_of_data *dn)
 	}
 
 	/* Deallocate node address */
+	/* 3. 把该 node 页占用的物理块标记为无效，并归还全局空闲池 */
 	f2fs_invalidate_blocks(sbi, ni.blk_addr, 1);
+	/* 4. 减少“有效 node 计数”：若是 inode 本身，则额外减 1 */
 	dec_valid_node_count(sbi, dn->inode, dn->nid == dn->inode->i_ino);
+	/* 5. 把 NAT 表项地址写成 NULL_ADDR，表示该 nid 已回收 */
 	set_node_addr(sbi, &ni, NULL_ADDR, false);
-
+	
+	/* 6. 如果是 inode 本身被删，还需：
+	 *   - 清孤儿表
+	 *   - 减少“有效 inode 计数”
+	 *   - 标记 inode 已同步（避免恢复）
+	 */
 	if (dn->nid == dn->inode->i_ino) {
 		f2fs_remove_orphan_inode(sbi, dn->nid);
 		dec_valid_inode_count(sbi);
 		f2fs_inode_synced(dn->inode);
 	}
-
+	/* 7. 清 node page 脏标记，标记超级块脏 */
 	clear_node_folio_dirty(dn->node_folio);
 	set_sbi_flag(sbi, SBI_IS_DIRTY);
-
+	/* 8. 放掉 node page 缓存，并从 NODE_MAPPING 中刷掉该页 */
 	index = dn->node_folio->index;
 	f2fs_folio_put(dn->node_folio, true);
 
 	invalidate_mapping_pages(NODE_MAPPING(sbi),
 			index, index);
 
-	dn->node_folio = NULL;
+	dn->node_folio = NULL;	/* 防止悬垂指针 */
 	trace_f2fs_truncate_node(dn->inode, dn->nid, ni.blk_addr);
 
 	return 0;
 }
 
+// 释放一个直接 node（数据块地址表页）:读 node→一致性检查→清所有数据块地址→释放 node 页本身
 static int truncate_dnode(struct dnode_of_data *dn)
 {
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dn->inode);
 	struct folio *folio;
 	int err;
-
+	/* 1. nid 为 0 说明已释放，返回 1 表示“已处理” */
 	if (dn->nid == 0)
 		return 1;
 
 	/* get direct node */
+	/* 2. 读该直接 node 页（引用计数+1）*/
 	folio = f2fs_get_node_folio(sbi, dn->nid);
 	if (PTR_ERR(folio) == -ENOENT)
-		return 1;
+		return 1;	/* 不存在，视为已处理 */
 	else if (IS_ERR(folio))
-		return PTR_ERR(folio);
-
+		return PTR_ERR(folio);	/* 其他错误直接返回 */
+	/* 3. 一致性检查：必须是数据 node，且属于同一 inode */
 	if (IS_INODE(&folio->page) || ino_of_node(&folio->page) != dn->inode->i_ino) {
 		f2fs_err(sbi, "incorrect node reference, ino: %lu, nid: %u, ino_of_node: %u",
 				dn->inode->i_ino, dn->nid, ino_of_node(&folio->page));
@@ -971,149 +1109,168 @@ static int truncate_dnode(struct dnode_of_data *dn)
 	}
 
 	/* Make dnode_of_data for parameter */
+	/* 4. 构造 dnode_of_data，指向该直接 node 页，偏移从 0 开始 */
 	dn->node_folio = folio;
 	dn->ofs_in_node = 0;
+	/* 5. 一次性释放该直接 node 内所有数据块地址（清成 NULL_ADDR）*/
 	f2fs_truncate_data_blocks_range(dn, ADDRS_PER_BLOCK(dn->inode));
-	err = truncate_node(dn);
+	err = truncate_node(dn);	/* 6. 释放该直接 node 页本身（把 node 页标记为无效并回收 nid）*/
 	if (err) {
 		f2fs_folio_put(folio, true);
 		return err;
 	}
-
+	/* 返回 1 表示“已处理 1 个 node” */
 	return 1;
 }
 
+// 递归释放一整棵间接 node 树:
+// 读间接页→深度<3 直接删直接 node，否则递归→整页空就自删，逐层返回已释放 node 数。
 static int truncate_nodes(struct dnode_of_data *dn, unsigned int nofs,
 						int ofs, int depth)
 {
-	struct dnode_of_data rdn = *dn;
+	struct dnode_of_data rdn = *dn;	/* 用于下层递归的临时 dn */
 	struct folio *folio;
 	struct f2fs_node *rn;
 	nid_t child_nid;
 	unsigned int child_nofs;
-	int freed = 0;
+	int freed = 0;	/* 本层已释放 node 数 */
 	int i, ret;
-
+	/* 1. nid 为 0 说明已释放，返回 NIDS_PER_BLOCK+1 告诉上层“整页已空” */
 	if (dn->nid == 0)
 		return NIDS_PER_BLOCK + 1;
 
 	trace_f2fs_truncate_nodes_enter(dn->inode, dn->nid, dn->data_blkaddr);
-
+	/* 2. 读当前间接 node 页（引用+1）*/
 	folio = f2fs_get_node_folio(F2FS_I_SB(dn->inode), dn->nid);
 	if (IS_ERR(folio)) {
 		trace_f2fs_truncate_nodes_exit(dn->inode, PTR_ERR(folio));
 		return PTR_ERR(folio);
 	}
-
+	/* 3. 预读后续 node 页，加速循环 */
 	f2fs_ra_node_pages(folio, ofs, NIDS_PER_BLOCK);
-
+	/* 4. 根据深度决定是“释放直接 node”还是“继续递归间接 node”*/
 	rn = F2FS_NODE(&folio->page);
 	if (depth < 3) {
+		/* 4a. 一级或二级间接：下面挂的是直接 node，一次性全删 */
 		for (i = ofs; i < NIDS_PER_BLOCK; i++, freed++) {
 			child_nid = le32_to_cpu(rn->in.nid[i]);
 			if (child_nid == 0)
-				continue;
+				continue;	/* 空槽跳过 */
 			rdn.nid = child_nid;
-			ret = truncate_dnode(&rdn);
+			ret = truncate_dnode(&rdn);	/* 释放直接 node */
 			if (ret < 0)
 				goto out_err;
+			/* 把槽位置 0 */
 			if (set_nid(folio, i, 0, false))
 				dn->node_changed = true;
 		}
 	} else {
+		/* 4b. 三级间接：下面挂的是二级间接，继续递归 */
 		child_nofs = nofs + ofs * (NIDS_PER_BLOCK + 1) + 1;
 		for (i = ofs; i < NIDS_PER_BLOCK; i++) {
 			child_nid = le32_to_cpu(rn->in.nid[i]);
 			if (child_nid == 0) {
+				/* 空槽，累加后续 node 数即可 */
 				child_nofs += NIDS_PER_BLOCK + 1;
 				continue;
 			}
 			rdn.nid = child_nid;
 			ret = truncate_nodes(&rdn, child_nofs, 0, depth - 1);
 			if (ret == (NIDS_PER_BLOCK + 1)) {
+				/* 下层整页已空，把本槽位置 0 */
 				if (set_nid(folio, i, 0, false))
 					dn->node_changed = true;
-				child_nofs += ret;
+				child_nofs += ret;	/* 累加已释放 node 数 */
 			} else if (ret < 0 && ret != -ENOENT) {
-				goto out_err;
+				goto out_err;	/* 真错误，向上传递 */
 			}
 		}
-		freed = child_nofs;
+		freed = child_nofs;	/* 三级间接返回的是累计 node 数 */
 	}
 
+	/* 5. 如果本层从槽位 0 开始截断，说明整页已空，把本间接 node 页本身也删掉 */
 	if (!ofs) {
 		/* remove current indirect node */
 		dn->node_folio = folio;
-		ret = truncate_node(dn);
+		ret = truncate_node(dn);	/* 释放整页 + nid → NULL_ADDR */
 		if (ret)
 			goto out_err;
-		freed++;
+		freed++;	/* 算上自己这一页 */
 	} else {
-		f2fs_folio_put(folio, true);
+		f2fs_folio_put(folio, true);	/* 仅放引用，不删整页 */
 	}
 	trace_f2fs_truncate_nodes_exit(dn->inode, freed);
-	return freed;
+	return freed;	/* 返回本层释放的 node 总数 */
 
 out_err:
 	f2fs_folio_put(folio, true);
 	trace_f2fs_truncate_nodes_exit(dn->inode, ret);
-	return ret;
+	return ret;	/* 出错时返回负错误码 */
 }
 
+// 截断部分间接 node（只释放后半段）
+// 读路径→预读→截后半段 direct node→若全空则连间接块一起删→推进偏移，五步完成部分间接块释放。
 static int truncate_partial_nodes(struct dnode_of_data *dn,
 			struct f2fs_inode *ri, int *offset, int depth)
 {
-	struct folio *folios[2];
-	nid_t nid[3];
+	struct folio *folios[2];	/* 最多两级间接块（L1/L2）*/
+	nid_t nid[3];	/* 路径上三级 nid：inode→L1→L2→L3 */
 	nid_t child_nid;
 	int err = 0;
 	int i;
-	int idx = depth - 2;
+	int idx = depth - 2;	/* 要截断的“最深层”间接块下标 */
 
+	/* 1. 取出 inode 中对应槽位的 nid（L1 或 L2）*/
 	nid[0] = get_nid(&dn->inode_folio->page, offset[0], true);
 	if (!nid[0])
-		return 0;
+		return 0;	/* 已是 0，无需处理 */
 
 	/* get indirect nodes in the path */
+	/* 2. 沿路径读出所有间接 node 页（L1、L2），引用计数+1 */
 	for (i = 0; i < idx + 1; i++) {
 		/* reference count'll be increased */
 		folios[i] = f2fs_get_node_folio(F2FS_I_SB(dn->inode), nid[i]);
 		if (IS_ERR(folios[i])) {
 			err = PTR_ERR(folios[i]);
-			idx = i - 1;
+			idx = i - 1;	/* 出错时只放到 idx 为止 */
 			goto fail;
 		}
+		/* 读出下一级 nid（L2→L3）*/
 		nid[i + 1] = get_nid(&folios[i]->page, offset[i + 1], false);
 	}
-
+	/* 3. 预读后续 node 页，加速循环 */
 	f2fs_ra_node_pages(folios[idx], offset[idx + 1], NIDS_PER_BLOCK);
 
 	/* free direct nodes linked to a partial indirect node */
+	/* 4. 释放“最深层”间接块中 [offset[idx+1], NIDS_PER_BLOCK) 区间的所有直接 node */
 	for (i = offset[idx + 1]; i < NIDS_PER_BLOCK; i++) {
 		child_nid = get_nid(&folios[idx]->page, i, false);
 		if (!child_nid)
-			continue;
+			continue;	/* 空槽，跳过 */
 		dn->nid = child_nid;
-		err = truncate_dnode(dn);
+		err = truncate_dnode(dn);	/* 释放该直接 node */
 		if (err < 0)
 			goto fail;
+		/* 把槽位置 0，表示已释放 */
 		if (set_nid(folios[idx], i, 0, false))
 			dn->node_changed = true;
 	}
-
+	/* 5. 如果整个“最深层”间接块都被清空，则把该间接块本身也删掉 */
 	if (offset[idx + 1] == 0) {
 		dn->node_folio = folios[idx];
 		dn->nid = nid[idx];
-		err = truncate_node(dn);
+		err = truncate_node(dn);	/* 释放整页间接块 */
 		if (err)
 			goto fail;
-	} else {
+	} else {	/* 否则只放引用，不删整页 */
 		f2fs_folio_put(folios[idx], true);
 	}
+	/* 6. 推进路径偏移，表示前半段已处理完 */
 	offset[idx]++;
 	offset[idx + 1] = 0;
 	idx--;
 fail:
+	/* 7. 出错或正常结束，递减引用并放页 */
 	for (i = idx; i >= 0; i--)
 		f2fs_folio_put(folios[i], true);
 
@@ -1125,21 +1282,27 @@ fail:
 /*
  * All the block addresses of data and nodes should be nullified.
  */
+// 级联释放从 from 开始的所有 node（间接块）
+// 算路径→读 inode→按级释放 node→清 nid→累加计数，五步把从 from 开始的所有间接块连根拔掉。
+/*
+ * 从指定页号 from 开始，把该 inode 的所有 node（含间接块）全部回收，
+ * 并清掉对应 nid，使地址表彻底归零。
+ */
 int f2fs_truncate_inode_blocks(struct inode *inode, pgoff_t from)
 {
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
-	int err = 0, cont = 1;
-	int level, offset[4], noffset[4];
-	unsigned int nofs = 0;
+	int err = 0, cont = 1;	/* cont: 是否继续处理下一级间接块 */
+	int level, offset[4], noffset[4];	/* offset[]: 每级在父块中的槽位下标 */
+	unsigned int nofs = 0;	/* 当前已处理的 node 总数 */
 	struct f2fs_inode *ri;
 	struct dnode_of_data dn;
 	struct folio *folio;
 
 	trace_f2fs_truncate_inode_blocks_enter(inode, from);
-
+	/* 1. 根据 from 计算出需要释放的“node 路径”：level 表示深度，offset[] 表示每级槽位 */
 	level = get_node_path(inode, from, offset, noffset);
 	if (level <= 0) {
-		if (!level) {
+		if (!level) {	/* level==0 表示 inode 本身损坏 */
 			level = -EFSCORRUPTED;
 			f2fs_err(sbi, "%s: inode ino=%lx has corrupted node block, from:%lu addrs:%u",
 					__func__, inode->i_ino,
@@ -1149,7 +1312,7 @@ int f2fs_truncate_inode_blocks(struct inode *inode, pgoff_t from)
 		trace_f2fs_truncate_inode_blocks_exit(inode, level);
 		return level;
 	}
-
+	/* 2. 读 inode node page（node page 0）*/
 	folio = f2fs_get_inode_folio(sbi, inode->i_ino);
 	if (IS_ERR(folio)) {
 		trace_f2fs_truncate_inode_blocks_exit(inode, PTR_ERR(folio));
@@ -1157,25 +1320,27 @@ int f2fs_truncate_inode_blocks(struct inode *inode, pgoff_t from)
 	}
 
 	set_new_dnode(&dn, inode, folio, NULL, 0);
-	folio_unlock(folio);
+	folio_unlock(folio);	/* 先解锁，后续函数自己会再锁 */
 
+	/* 3. 根据 level 计算当前要处理的第一个间接块在 inode 中的起始 nid 槽位 */
 	ri = F2FS_INODE(&folio->page);
 	switch (level) {
 	case 0:
 	case 1:
-		nofs = noffset[1];
+		nofs = noffset[1];	/* 一级间接 */
 		break;
 	case 2:
 		nofs = noffset[1];
-		if (!offset[level - 1])
+		if (!offset[level - 1])	/* 如果上一级槽位为 0，说明无需处理部分块 */
 			goto skip_partial;
+		/* 先截掉部分二级间接块 */
 		err = truncate_partial_nodes(&dn, ri, offset, level);
 		if (err < 0 && err != -ENOENT)
 			goto fail;
-		nofs += 1 + NIDS_PER_BLOCK;
+		nofs += 1 + NIDS_PER_BLOCK;	/* 跳过已处理的部分 */
 		break;
 	case 3:
-		nofs = 5 + 2 * NIDS_PER_BLOCK;
+		nofs = 5 + 2 * NIDS_PER_BLOCK;	/* 三级间接起始槽位固定 */
 		if (!offset[level - 1])
 			goto skip_partial;
 		err = truncate_partial_nodes(&dn, ri, offset, level);
@@ -1186,21 +1351,25 @@ int f2fs_truncate_inode_blocks(struct inode *inode, pgoff_t from)
 		BUG();
 	}
 
-skip_partial:
+skip_partial:	/* 4. 主循环：逐级释放 node 块（含间接块）*/
 	while (cont) {
+		/* 4a. 取出当前要释放的 node id */
 		dn.nid = get_nid(&folio->page, offset[0], true);
 		switch (offset[0]) {
 		case NODE_DIR1_BLOCK:
 		case NODE_DIR2_BLOCK:
+			/* 直接 node（inode 内）→ 一次性释放 */
 			err = truncate_dnode(&dn);
 			break;
 
 		case NODE_IND1_BLOCK:
 		case NODE_IND2_BLOCK:
+			/* 一级间接块 → 释放下面所有直接 node */
 			err = truncate_nodes(&dn, nofs, offset[1], 2);
 			break;
 
 		case NODE_DIND_BLOCK:
+			/* 二级间接块 → 释放下面所有一级间接块，完成后 cont=0 退出 */
 			err = truncate_nodes(&dn, nofs, offset[1], 3);
 			cont = 0;
 			break;
@@ -1208,6 +1377,7 @@ skip_partial:
 		default:
 			BUG();
 		}
+		/* -ENOENT 说明 node 已不存在，打标志提醒 fsck，但不算错误 */
 		if (err == -ENOENT) {
 			set_sbi_flag(F2FS_F_SB(folio), SBI_NEED_FSCK);
 			f2fs_handle_error(sbi, ERROR_INVALID_BLKADDR);
@@ -1220,15 +1390,17 @@ skip_partial:
 		}
 		if (err < 0)
 			goto fail;
+		/* 4b. 如果当前一级槽位已用完且还有 nid，清掉 inode 中的 nid 槽位 */
 		if (offset[1] == 0 && get_nid(&folio->page, offset[0], true)) {
 			folio_lock(folio);
 			BUG_ON(!is_node_folio(folio));
 			set_nid(folio, offset[0], 0, true);
 			folio_unlock(folio);
 		}
+		/* 4c. 推进到下一级间接块 */
 		offset[1] = 0;
 		offset[0]++;
-		nofs += err;
+		nofs += err;	/* err 返回的是本次释放的 node 数 */
 	}
 fail:
 	f2fs_folio_put(folio, false);
@@ -1391,43 +1563,63 @@ fail:
  * 0: f2fs_folio_put(folio, false)
  * LOCKED_PAGE or error: f2fs_folio_put(folio, true)
  */
+// 用于从磁盘读取节点页（node page）到 folio 缓存的核心函数 read_node_folio。
+// 它被调用时，目标 folio 已经被分配并加锁（通常由上层如 f2fs_grab_cache_folio 获取），但尚未填充数据。
+// 返回值含义：
+// 0：表示已成功发起异步 I/O（或数据已在缓存且有效），调用者应调用 f2fs_folio_put(folio, false) —— 即不解锁（因为可能还在等待 I/O 完成）。
+// LOCKED_PAGE（通常定义为 1）或负错误码：表示 folio 已就绪（如已 uptodate）或发生错误，调用者需调用 f2fs_folio_put(folio, true) —— 释放锁。
+// F2FS 中常将 LOCKED_PAGE 定义为 1，作为特殊返回值，区别于错误码（负值）和成功发起 I/O（0）。
 static int read_node_folio(struct folio *folio, blk_opf_t op_flags)
 {
-	struct f2fs_sb_info *sbi = F2FS_F_SB(folio);
+	struct f2fs_sb_info *sbi = F2FS_F_SB(folio);	// 从 folio 所属 inode 提取超级块信息 sbi。
 	struct node_info ni;
+	// 1. 初始化上下文,用于描述本次 I/O 请求：
 	struct f2fs_io_info fio = {
 		.sbi = sbi,
-		.type = NODE,
-		.op = REQ_OP_READ,
-		.op_flags = op_flags,
-		.page = &folio->page,
+		.type = NODE,	// 类型为 NODE（节点页，非数据页）
+		.op = REQ_OP_READ,	// 操作为读（REQ_OP_READ）
+		.op_flags = op_flags,	// 使用传入的 op_flags（如 REQ_SYNC 等）
+		.page = &folio->page,	// 关联 folio 的底层 page（因部分旧接口仍用 struct page*）
 		.encrypted_page = NULL,
 	};
 	int err;
 
-	if (folio_test_uptodate(folio)) {
-		if (!f2fs_inode_chksum_verify(sbi, folio)) {
-			folio_clear_uptodate(folio);
+	// 2. 检查 folio 是否已是最新的（uptodate）
+	if (folio_test_uptodate(folio)) {	// 如果 folio 已标记为 uptodate（即缓存中有有效数据）：
+		if (!f2fs_inode_chksum_verify(sbi, folio)) {	// 验证校验和（checksum）：F2FS 对节点页启用校验和保护。
+			folio_clear_uptodate(folio);	// 若校验失败 → 清除 uptodate 标志，返回 -EFSBADCRC（文件系统损坏）。
 			return -EFSBADCRC;
 		}
+		// 若校验通过 → 直接返回 LOCKED_PAGE，表示“数据已准备好，无需 I/O”。
 		return LOCKED_PAGE;
 	}
 
+	// 3. 获取节点在磁盘上的物理地址
+	// f2fs_get_node_info() 查询 NAT（Node Address Table）获取该 node 的物理块地址 ni.blk_addr。
+	// folio->index 是该节点页在 node 地址空间中的逻辑编号（即 node id）。
 	err = f2fs_get_node_info(sbi, folio->index, &ni, false);
-	if (err)
+	if (err)	// 若查询失败（如 NAT 损坏），直接返回错误。
 		return err;
 
 	/* NEW_ADDR can be seen, after cp_error drops some dirty node pages */
+	// 4. 处理无效或未分配的节点地址
+	// NULL_ADDR：表示该 node 从未被分配（如已被删除）。
+	// NEW_ADDR：表示该 node 刚被创建但尚未写入磁盘（例如在 checkpoint 错误后残留的脏页）。
+	// 在这两种情况下，无法读取有效数据 → 返回 -ENOENT（“无此节点”）。
 	if (unlikely(ni.blk_addr == NULL_ADDR || ni.blk_addr == NEW_ADDR)) {
 		folio_clear_uptodate(folio);
 		return -ENOENT;
 	}
 
+	// 5. 提交 I/O 请求
+	// 设置 I/O 的目标块地址（读操作中 new_blkaddr == old_blkaddr）。
 	fio.new_blkaddr = fio.old_blkaddr = ni.blk_addr;
 
+	// 调用 f2fs_submit_page_bio() 发起异步读请求。
+	// 成功时返回 0（I/O 已提交，但未完成）
 	err = f2fs_submit_page_bio(&fio);
 
-	if (!err)
+	if (!err)	// 若 I/O 提交成功，更新 I/O 统计信息（f2fs_update_iostat）。
 		f2fs_update_iostat(sbi, NULL, FS_NODE_READ_IO, F2FS_BLKSIZE);
 
 	return err;
@@ -1436,25 +1628,34 @@ static int read_node_folio(struct folio *folio, blk_opf_t op_flags)
 /*
  * Readahead a node page
  */
+// 对单个 node 页做异步预读
+/*
+ * 对单个 node 页（nid）做异步预读（readahead）：
+ * 若页已在缓存则直接返回；否则抓取并提交异步读，不等待完成。
+ */
 void f2fs_ra_node_page(struct f2fs_sb_info *sbi, nid_t nid)
 {
 	struct folio *afolio;
 	int err;
 
-	if (!nid)
+	if (!nid)	/* 0 号 nid 非法 → 直接返回*/
 		return;
 	if (f2fs_check_nid_range(sbi, nid))
-		return;
+		return;	/* 越界 nid → 直接返回*/
 
+	/* 1. 快速检查：页已在 radix-tree → 无需预读*/
 	afolio = xa_load(&NODE_MAPPING(sbi)->i_pages, nid);
 	if (afolio)
-		return;
+		return;	/* 已存在 → 直接返回*/
 
+	/* 2. 抓取 folio（不锁，仅增加引用）*/
 	afolio = f2fs_grab_cache_folio(NODE_MAPPING(sbi), nid, false);
 	if (IS_ERR(afolio))
-		return;
+		return;	/* 抓取失败 → 直接返回*/
 
+	/* 3. 提交异步读（REQ_RAHEAD）→ 不等待完成*/
 	err = read_node_folio(afolio, REQ_RAHEAD);
+	/* 4. 释放引用：若读失败则解锁，成功则保持 uptodate 状态*/
 	f2fs_folio_put(afolio, err ? true : false);
 }
 
@@ -1481,58 +1682,76 @@ static int sanity_check_node_footer(struct f2fs_sb_info *sbi,
 	return 0;
 }
 
+// 把指定 nid 的 node 页抓到内存并校验
+/*
+ * 根据 node id (nid) 抓取对应的 node 页（folio），
+ * 可选预读后续 node 页，并做完整性/校验和/类型校验。
+ * 返回锁定的 uptodate folio，失败返回 ERR_PTR(-错误码)。
+ */
+// “抓页 → 读盘 → 加锁 → 完整性+CRC+footer 校验 → 返回锁定 uptodate folio；
+// 任何失败 → 清标记、上报 EIO、解锁返回。”
 static struct folio *__get_node_folio(struct f2fs_sb_info *sbi, pgoff_t nid,
 		struct folio *parent, int start, enum node_type ntype)
 {
 	struct folio *folio;
 	int err;
 
+	/* 0 号 nid 非法 → -ENOENT */
 	if (!nid)
 		return ERR_PTR(-ENOENT);
+	/* nid 超出超级块范围 → -EINVAL */
 	if (f2fs_check_nid_range(sbi, nid))
 		return ERR_PTR(-EINVAL);
 repeat:
+	/* 1. 从 NODE 映射树里抓取 folio（不锁）*/
 	folio = f2fs_grab_cache_folio(NODE_MAPPING(sbi), nid, false);
 	if (IS_ERR(folio))
-		return folio;
+		return folio;	/* 抓取失败直接返回 */
 
+	/* 2. 读盘 → 等待 I/O 完成 → 标记 uptodate */
 	err = read_node_folio(folio, 0);
 	if (err < 0)
-		goto out_put_err;
+		goto out_put_err;	/* 读盘失败 → 清理并返回 */
 	if (err == LOCKED_PAGE)
-		goto page_hit;
+		goto page_hit;	/* 页正被锁 → 跳过重复加锁 */
 
+	/* 3. 可选预读：若传了 parent，则预读后续 node 页（RA）*/
 	if (parent)
 		f2fs_ra_node_pages(parent, start + 1, MAX_RA_NODE);
 
-	folio_lock(folio);
+	folio_lock(folio);	/* 4. 加页锁（独占）*/
 
+	/* 5. 完整性校验：必须是 node 页，且已 uptodate*/
 	if (unlikely(!is_node_folio(folio))) {
-		f2fs_folio_put(folio, true);
-		goto repeat;
+		f2fs_folio_put(folio, true);	/* 不是 node 页 → 解锁并丢弃 */
+		goto repeat;	/* 重试（极少见）*/
 	}
 
 	if (unlikely(!folio_test_uptodate(folio))) {
-		err = -EIO;
+		err = -EIO;	/* 读盘失败 → -EIO */
 		goto out_err;
 	}
 
+	/* 6. 校验和验证：node 页 footer 的 CRC 必须正确*/
 	if (!f2fs_inode_chksum_verify(sbi, folio)) {
-		err = -EFSBADCRC;
+		err = -EFSBADCRC;	/* CRC 错 → -EFSBADCRC */
 		goto out_err;
 	}
 page_hit:
+	/* 7. footer  sanity 检查：nid、类型、版本号必须匹配*/
 	err = sanity_check_node_footer(sbi, folio, nid, ntype);
 	if (!err)
-		return folio;
+		return folio;	/* 全部通过 → 返回锁定的 uptodate folio */
 out_err:
+	/* 8. 校验失败 → 清 uptodate 标记，防止后续误用*/
 	folio_clear_uptodate(folio);
 out_put_err:
 	/* ENOENT comes from read_node_folio which is not an error. */
+	/* ENOENT 来自 read_node_folio，不是错误，其余都要上报 EIO*/
 	if (err != -ENOENT)
 		f2fs_handle_page_eio(sbi, folio, NODE);
-	f2fs_folio_put(folio, true);
-	return ERR_PTR(err);
+	f2fs_folio_put(folio, true);	/* 解锁并释放 folio*/
+	return ERR_PTR(err);	/* 返回错误码*/
 }
 
 struct folio *f2fs_get_node_folio(struct f2fs_sb_info *sbi, pgoff_t nid)
@@ -1540,8 +1759,13 @@ struct folio *f2fs_get_node_folio(struct f2fs_sb_info *sbi, pgoff_t nid)
 	return __get_node_folio(sbi, nid, NULL, 0, NODE_TYPE_REGULAR);
 }
 
+// “拿到 inode 所在的 node 页（folio）” 的最简封装：
+// “根据 inode 号 ino，返回其 node 页的 folio 指针，不锁页、不等待、不预读。”
 struct folio *f2fs_get_inode_folio(struct f2fs_sb_info *sbi, pgoff_t ino)
 {
+	// NULL	不指定父 folio（inode 无父）
+	// 0	不预读额外页
+	// NODE_TYPE_INODE	告诉底层 这是 inode 页，不需要加锁
 	return __get_node_folio(sbi, ino, NULL, 0, NODE_TYPE_INODE);
 }
 
@@ -2255,46 +2479,62 @@ static void __remove_free_nid(struct f2fs_sb_info *sbi,
 	radix_tree_delete(&nm_i->free_nid_root, i->nid);
 }
 
+// 把一条 free_nid 从一个状态池移到另一个状态池
+/*
+ * 将一条 free_nid 从 org_state 池移到 dst_state 池，
+ * 并更新计数器。只允许 PREALLOC_NID ↔ FREE_NID 双向移动。
+ */
 static void __move_free_nid(struct f2fs_sb_info *sbi, struct free_nid *i,
 			enum nid_state org_state, enum nid_state dst_state)
 {
 	struct f2fs_nm_info *nm_i = NM_I(sbi);
-
+	/* 断言：当前状态必须等于源状态*/
 	f2fs_bug_on(sbi, org_state != i->state);
+
+	/* 1. 更新状态字段和计数器*/
 	i->state = dst_state;
 	nm_i->nid_cnt[org_state]--;
 	nm_i->nid_cnt[dst_state]++;
-
+	/* 2. 根据目标状态调整链表位置*/
 	switch (dst_state) {
 	case PREALLOC_NID:
-		list_del(&i->list);
+		list_del(&i->list);	/* 从任何链表摘下（PREALLOC 不挂 LRU）*/
 		break;
-	case FREE_NID:
+	case FREE_NID:	/* 挂到 free_nid_list 尾部（LRU 顺序）*/
 		list_add_tail(&i->list, &nm_i->free_nid_list);
 		break;
-	default:
+	default:	/* 只允许上述两种状态*/
 		BUG_ON(1);
 	}
 }
 
+/*
+ * 按『块-内-位』三级结构，更新单个 nid 的空闲状态位图：
+ * set=true  → 标记为空闲（置 1）；
+ * set=false → 标记为已分配（清 0）；
+ * build=true → 重建阶段，不递减计数器。
+ */
 static void update_free_nid_bitmap(struct f2fs_sb_info *sbi, nid_t nid,
 							bool set, bool build)
 {
 	struct f2fs_nm_info *nm_i = NM_I(sbi);
-	unsigned int nat_ofs = NAT_BLOCK_OFFSET(nid);
-	unsigned int nid_ofs = nid - START_NID(nid);
+	unsigned int nat_ofs = NAT_BLOCK_OFFSET(nid);	/* 第几个 NAT 块（块级）*/
+	unsigned int nid_ofs = nid - START_NID(nid);	/* 在该块内的第几个 nid（内级）*/
 
+	/* 若该 NAT 块本身不是“全空”块 → 直接返回（只维护全空块的位图）*/
 	if (!test_bit_le(nat_ofs, nm_i->nat_block_bitmap))
 		return;
 
 	if (set) {
+		/* 标记为空闲：置 1，计数器++*/
 		if (test_bit_le(nid_ofs, nm_i->free_nid_bitmap[nat_ofs]))
-			return;
+			return;	/* 已是 1 → 无需重复置位*/
 		__set_bit_le(nid_ofs, nm_i->free_nid_bitmap[nat_ofs]);
 		nm_i->free_nid_count[nat_ofs]++;
 	} else {
+		/* 标记为已分配：清 0，计数器--（重建阶段不减）*/
 		if (!test_bit_le(nid_ofs, nm_i->free_nid_bitmap[nat_ofs]))
-			return;
+			return;	/* 已是 0 → 无需重复清零*/
 		__clear_bit_le(nid_ofs, nm_i->free_nid_bitmap[nat_ofs]);
 		if (!build)
 			nm_i->free_nid_count[nat_ofs]--;
@@ -2582,42 +2822,54 @@ int f2fs_build_free_nids(struct f2fs_sb_info *sbi, bool sync, bool mount)
  * from second parameter of this function.
  * The returned nid could be used ino as well as nid when inode is created.
  */
+// 从 free-nid 池里分配一个可用 nid:有 FREE_NID → 从 LRU 拿一个；池空 → 扫描 NAT 重建；故障注入 → 直接失败。
+/*
+ * 从 free-nid 池里分配一个可用 nid：
+ * 成功 → 把 nid 写入 *nid 并返回 true；
+ * 失败 → 返回 false（池空或故障注入）。
+ * 返回的 nid 既可用作 inode 号，也可用作 node id。
+ */
 bool f2fs_alloc_nid(struct f2fs_sb_info *sbi, nid_t *nid)
 {
 	struct f2fs_nm_info *nm_i = NM_I(sbi);
 	struct free_nid *i = NULL;
 retry:
+	/* 1. 故障注入：模拟分配失败（用于内核测试）*/
 	if (time_to_inject(sbi, FAULT_ALLOC_NID))
 		return false;
 
 	spin_lock(&nm_i->nid_list_lock);
-
+	/* 2. 池空 → 直接失败*/
 	if (unlikely(nm_i->available_nids == 0)) {
 		spin_unlock(&nm_i->nid_list_lock);
 		return false;
 	}
 
 	/* We should not use stale free nids created by f2fs_build_free_nids */
+	/* 3. 有 FREE_NID 且不在 build_free_nids 阶段 → 从 LRU 头部拿一个*/
 	if (nm_i->nid_cnt[FREE_NID] && !on_f2fs_build_free_nids(nm_i)) {
-		f2fs_bug_on(sbi, list_empty(&nm_i->free_nid_list));
+		f2fs_bug_on(sbi, list_empty(&nm_i->free_nid_list));	/* 必须非空*/
 		i = list_first_entry(&nm_i->free_nid_list,
 					struct free_nid, list);
-		*nid = i->nid;
+		*nid = i->nid;	/* 返回给调用者*/
 
+		/* 从 FREE_NID 移到 PREALLOC_NID（已分配但未落盘）*/
 		__move_free_nid(sbi, i, FREE_NID, PREALLOC_NID);
-		nm_i->available_nids--;
+		nm_i->available_nids--;	/* 全局可用计数减 1*/
 
+		/* 更新 free-nid 位图（置 0 表示已分配）*/
 		update_free_nid_bitmap(sbi, *nid, false, false);
 
 		spin_unlock(&nm_i->nid_list_lock);
-		return true;
+		return true;	/* 成功返回*/
 	}
 	spin_unlock(&nm_i->nid_list_lock);
 
 	/* Let's scan nat pages and its caches to get free nids */
+	/* 4. 池空 → 扫描 NAT 页和缓存，重建 free-nid 列表*/
 	if (!f2fs_build_free_nids(sbi, true, false))
-		goto retry;
-	return false;
+		goto retry;	/* 重建成功 → 重试*/
+	return false;	/* 重建失败 → 返回 false*/
 }
 
 /*

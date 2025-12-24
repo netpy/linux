@@ -200,27 +200,43 @@ static inline void get_nat_bitmap(struct f2fs_sb_info *sbi, void *addr)
 	memcpy(addr, nm_i->nat_bitmap, nm_i->bitmap_size);
 }
 
+// 根据 nid 算出它在 NAT 区域中的当前物理块号——F2FS 的 “双映射 + bitmap 跳转” 算法
+// 双映射：同一 segment 内相邻 NAT 块物理上隔 512 块；bitmap 置位 → 再跳 +512 到镜像段。
+/*
+ * 根据起始 nid，算出它在 NAT 区域中的 **当前物理块号**（current_nat_addr）。
+ * 返回的是 **4 KiB 物理块地址**，用于读/写 NAT 条目。
+ */
 static inline pgoff_t current_nat_addr(struct f2fs_sb_info *sbi, nid_t start)
 {
 	struct f2fs_nm_info *nm_i = NM_I(sbi);
-	pgoff_t block_off;
-	pgoff_t block_addr;
+	pgoff_t block_off;	/* NAT 块在 NAT 区域内的逻辑偏移（以块为单位）*/
+	pgoff_t block_addr;	/* 最终物理块地址（以块为单位）*/
 
 	/*
 	 * block_off = segment_off * 512 + off_in_segment
 	 * OLD = (segment_off * 512) * 2 + off_in_segment
 	 * NEW = 2 * (segment_off * 512 + off_in_segment) - off_in_segment
 	 */
-	block_off = NAT_BLOCK_OFFSET(start);
+	/*
+	 * 公式推导：
+	 * block_off = segment_off * 512 + off_in_segment
+	 * OLD = (segment_off * 512) * 2 + off_in_segment
+	 * NEW = 2 * (segment_off * 512 + off_in_segment) - off_in_segment
+	 * 即：NEW = 2 * block_off - (block_off & 511)
+	 * 结果：同一 segment 内相邻 NAT 块在物理上相隔 512 块（双映射）
+	 */
+	block_off = NAT_BLOCK_OFFSET(start);	/* 逻辑块号（以块为单位）*/
 
+	/* 双映射：物理地址 = 起始地址 + 2×逻辑偏移 - 段内偏移 */
 	block_addr = (pgoff_t)(nm_i->nat_blkaddr +
 		(block_off << 1) -
 		(block_off & (BLKS_PER_SEG(sbi) - 1)));
 
+	/* 若该逻辑块在 nat_bitmap 中被置位 → 使用“镜像”段（+512 块）*/
 	if (f2fs_test_bit(block_off, nm_i->nat_bitmap))
 		block_addr += BLKS_PER_SEG(sbi);
 
-	return block_addr;
+	return block_addr;	/* 返回 4 KiB 物理块地址 */
 }
 
 static inline pgoff_t next_nat_addr(struct f2fs_sb_info *sbi,
@@ -380,12 +396,19 @@ static inline int set_nid(struct folio *folio, int off, nid_t nid, bool i)
 	return folio_mark_dirty(folio);
 }
 
+// 从 node 页里取出指定偏移的 nid
+/*
+ * 从 node 页中取出第 off 个 nid（间接指针）。
+ * i=true  → 取 inode 区域的 i_nid[]；
+ * i=false → 取 node 区域的 nid[]。
+ */
 static inline nid_t get_nid(struct page *p, int off, bool i)
 {
-	struct f2fs_node *rn = F2FS_NODE(p);
+	struct f2fs_node *rn = F2FS_NODE(p);	/* 取出页内 node 结构 */
 
-	if (i)
+	if (i)	/* 取 inode 区域的 i_nid[off - NODE_DIR1_BLOCK]（仅用于 direct node）*/
 		return le32_to_cpu(rn->i.i_nid[off - NODE_DIR1_BLOCK]);
+	/* 取 node 区域的 nid[off]（用于 indirect/double-indirect node）*/
 	return le32_to_cpu(rn->in.nid[off]);
 }
 
