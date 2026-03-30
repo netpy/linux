@@ -4214,41 +4214,152 @@ out:
 	return ret;
 }
 
+/*
+ * f2fs_swap_activate - 激活F2FS交换文件
+ * @sis: 交换信息结构体，描述交换分区/文件的状态和配置
+ * @file: 交换文件的文件结构体指针
+ * @span: 输出参数，返回交换文件占用的扇区范围大小
+ *
+ * 功能：准备一个F2FS常规文件作为交换空间使用。执行必要的检查和设置：
+ * 1. 验证文件类型为常规文件（非目录、设备等）
+ * 2. 检查文件系统非只读
+ * 3. 在LFS模式下验证zoned设备支持
+ * 4. 转换可能的inline inode为常规数据布局
+ * 5. 确保文件非压缩格式（交换文件不支持压缩）
+ * 6. 将文件数据刷写到磁盘确保一致性
+ * 7. 预缓存文件的extent信息以优化交换性能
+ * 8. 调用通用交换激活检查逻辑
+ * 9. 更新交换文件统计和设置固定文件标志
+ *
+ * 返回值：
+ *  成功返回0，失败返回负的错误码（如-EINVAL、-EROFS等）
+ *  详细错误码：
+ *    -EINVAL: 文件非常规文件、LFS模式无zoned支持等参数错误
+ *    -EROFS: 文件系统为只读模式
+ *    -EOPNOTSUPP: 内核配置不支持交换文件（编译时未启用CONFIG_SWAP）
+ */
 static int f2fs_swap_activate(struct swap_info_struct *sis, struct file *file,
 				sector_t *span)
 {
-	struct inode *inode = file_inode(file);
-	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
-	int ret;
+	struct inode *inode = file_inode(file);		/* 从文件结构获取inode */
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);	/* 获取F2FS超级块信息 */
+	int ret;					/* 返回值变量 */
 
+	/* 检查1: 必须为常规文件，交换文件不支持目录、设备文件等 */
 	if (!S_ISREG(inode->i_mode))
 		return -EINVAL;
 
+	/* 检查2: 文件系统不能是只读的，交换需要写入操作 */
 	if (f2fs_readonly(sbi->sb))
 		return -EROFS;
 
+	/* 检查3: LFS(Log-Structured File System)模式下需要zoned块设备支持 */
 	if (f2fs_lfs_mode(sbi) && !f2fs_sb_has_blkzoned(sbi)) {
 		f2fs_err(sbi, "Swapfile not supported in LFS mode");
 		return -EINVAL;
 	}
 
+	/* 步骤1: 转换inline inode为常规数据布局（如果文件数据存储在inode内）
+	 * f2fs_convert_inline_inode() - 将内联数据inode转换为常规数据块存储
+	 * 功能：检查inode是否包含内联数据（数据直接存储在inode中而非数据块），
+	 *       如果是则分配数据块并将内联数据迁移到数据块中。
+	 * 内部调用链（第3层）：
+	 *   - f2fs_has_inline_data(): 检查inode是否包含内联数据标志
+	 *   - f2fs_dquot_initialize(): 初始化磁盘配额
+	 *   - f2fs_grab_cache_folio(): 获取页面缓存中的folio
+	 *   - f2fs_lock_op(): 加F2FS操作锁防止并发修改
+	 *   - f2fs_get_inode_folio(): 获取inode页面
+	 *   - f2fs_convert_inline_folio(): 实际转换内联数据到常规folio
+	 *   - f2fs_balance_fs(): 平衡文件系统空间使用
+	 * 返回值：成功返回0，失败返回负的错误码（如-EROFS只读错误等）
+	 */
 	ret = f2fs_convert_inline_inode(inode);
 	if (ret)
 		return ret;
 
+	/* 步骤2: 确保交换文件不是压缩文件，交换操作不支持压缩
+	 * f2fs_disable_compressed_file() - 禁用文件的压缩属性
+	 * 功能：检查文件是否启用了压缩，如果已启用则清除压缩标志。
+	 *       对于交换文件，必须禁用压缩因为交换子系统不支持压缩数据。
+	 * 内部调用链（第3层）：
+	 *   - f2fs_down_write(): 获取inode的信号量写锁
+	 *   - f2fs_compressed_file(): 检查inode是否设置了压缩标志
+	 *   - f2fs_is_mmap_file(): 检查文件是否为内存映射文件
+	 *   - F2FS_HAS_BLOCKS(): 检查inode是否已分配数据块
+	 *   - stat_dec_compr_inode(): 减少压缩inode统计计数
+	 *   - clear_inode_flag(): 清除inode的FI_COMPRESSED_FILE标志
+	 *   - f2fs_mark_inode_dirty_sync(): 标记inode为脏需要同步写回
+	 *   - f2fs_up_write(): 释放inode信号量写锁
+	 * 返回值：成功禁用压缩返回true，如果文件已是非压缩或无法禁用返回false
+	 */
 	if (!f2fs_disable_compressed_file(inode))
 		return -EINVAL;
 
+	/* 步骤3: 将文件的脏页刷写到磁盘，确保交换文件数据一致性
+	 * filemap_fdatawrite() - 将地址空间的所有脏页写回磁盘
+	 * 功能：强制将文件映射中的所有脏数据页刷写到存储设备，确保交换文件
+	 *       激活前数据已持久化，避免交换过程中数据不一致。
+	 * 内部调用链（第3层）：
+	 *   - __filemap_fdatawrite_range(): 执行指定范围的脏页写回
+	 *   - mapping->a_ops->writepages(): 调用地址空间操作writepages方法
+	 *   - do_writepages(): 实际执行页面写回操作
+	 * 返回值：成功返回0，失败返回负的错误码
+	 */
 	ret = filemap_fdatawrite(inode->i_mapping);
 	if (ret < 0)
 		return ret;
 
+	/* 步骤4: 预缓存文件的extent信息，优化交换时的块查找性能
+	 * f2fs_precache_extents() - 预缓存文件的extent映射信息
+	 * 功能：遍历文件的整个逻辑块范围，提前查询并缓存物理块映射关系。
+	 *       对于交换文件，预缓存extent可以显著提高交换性能，因为交换操作
+	 *       需要频繁的块映射查询，预缓存减少运行时查询开销。
+	 * 内部调用链（第3层）：
+	 *   - is_inode_flag_set(): 检查inode是否设置FI_NO_EXTENT标志
+	 *   - i_size_read(): 读取inode的文件大小
+	 *   - f2fs_down_write(): 获取垃圾回收读写信号量
+	 *   - f2fs_map_blocks(): 映射逻辑块到物理块（F2FS_GET_BLOCK_PRECACHE模式）
+	 *   - f2fs_up_write(): 释放垃圾回收读写信号量
+	 * 返回值：成功返回0，失败返回负的错误码（如-EOPNOTSUPP不支持extent）
+	 */
 	f2fs_precache_extents(inode);
 
+	/* 步骤5: 调用通用交换激活检查，验证文件大小、对齐等约束
+	 * check_swap_activate() - 检查交换文件的有效性和对齐要求（F2FS专用）
+	 * 功能：验证交换文件满足F2FS文件系统的特殊要求：
+	 *       1. 文件必须连续无空洞（交换文件不能有稀疏区域）
+	 *       2. 物理块必须对齐到section边界（F2FS段清理要求）
+	 *       3. 计算交换文件占用的物理块范围用于设置span参数
+	 *       4. 验证文件大小不超过交换子系统限制
+	 * 内部调用链（第3层）：
+	 *   - i_size_read(): 读取文件大小
+	 *   - f2fs_map_blocks(): 映射逻辑块到物理块（F2FS_GET_BLOCK_FIEMAP模式）
+	 *   - cond_resched(): 条件调度避免长时间占用CPU
+	 *   - f2fs_down_write(): 获取垃圾回收读写信号量
+	 *   - f2fs_up_write(): 释放垃圾回收读写信号量
+	 * 返回值：成功返回0，失败返回负的错误码（如-EINVAL无效文件）
+	 */
 	ret = check_swap_activate(sis, file, span);
 	if (ret < 0)
 		return ret;
 
+	/* 步骤6: 更新统计信息，标记inode为交换文件，设置固定文件标志防止迁移
+	 * stat_inc_swapfile_inode() - 增加交换文件inode统计计数
+	 * 功能：原子增加sbi->swapfile_inode计数，跟踪系统中F2FS交换文件数量。
+	 * 内部实现：atomic_inc(&F2FS_I_SB(inode)->swapfile_inode)
+	 *
+	 * set_inode_flag(inode, FI_PIN_FILE) - 设置inode固定文件标志
+	 * 功能：标记inode为固定文件，防止数据迁移和垃圾回收移动。
+	 *       交换文件需要固定位置，不能由F2FS垃圾回收或碎片整理移动。
+	 * 内部调用链（第3层）：
+	 *   - set_bit(): 设置inode标志位
+	 *   - __mark_inode_dirty_flag(): 标记inode为脏需要写回
+	 *
+	 * f2fs_update_time(sbi, REQ_TIME) - 更新请求时间戳
+	 * 功能：更新文件系统的最后请求时间，用于统计和监控。
+	 *       同时更新DISCARD_TIME和GC_TIME（基于REQ_TIME）。
+	 * 内部实现：sbi->last_time[type] = jiffies
+	 */
 	stat_inc_swapfile_inode(inode);
 	set_inode_flag(inode, FI_PIN_FILE);
 	f2fs_update_time(sbi, REQ_TIME);

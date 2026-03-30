@@ -6,6 +6,7 @@
  *             http://www.samsung.com/
  */
 /* start node id of a node block dedicated to the given node id */
+// 用于计算给定起始节点ID在F2FS文件系统的NAT（Node Address Table，节点地址表）区域中对应的物理块偏移量。
 #define	START_NID(nid) (((nid) / NAT_ENTRY_PER_BLOCK) * NAT_ENTRY_PER_BLOCK)
 
 /* node block offset on the NAT area dedicated to the given start node id */
@@ -203,7 +204,7 @@ static inline void get_nat_bitmap(struct f2fs_sb_info *sbi, void *addr)
 // 根据 nid 算出它在 NAT 区域中的当前物理块号——F2FS 的 “双映射 + bitmap 跳转” 算法
 // 双映射：同一 segment 内相邻 NAT 块物理上隔 512 块；bitmap 置位 → 再跳 +512 到镜像段。
 /*
- * 根据起始 nid，算出它在 NAT 区域中的 **当前物理块号**（current_nat_addr）。
+ * 根据起始 nid，算出它的net_entry在 NAT 区域中的 **当前物理块号**（current_nat_addr）。
  * 返回的是 **4 KiB 物理块地址**，用于读/写 NAT 条目。
  */
 static inline pgoff_t current_nat_addr(struct f2fs_sb_info *sbi, nid_t start)

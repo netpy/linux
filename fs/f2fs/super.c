@@ -4682,6 +4682,7 @@ try_onemore:
 		goto free_xattr_cache;
 
 	/* get an inode for meta space */
+	// f2fs将所有的文件系统元数据看作一个文件，使用一个inode来管理meta对应的page
 	sbi->meta_inode = f2fs_iget(sb, F2FS_META_INO(sbi));
 	if (IS_ERR(sbi->meta_inode)) {
 		f2fs_err(sbi, "Failed to read F2FS meta data inode");

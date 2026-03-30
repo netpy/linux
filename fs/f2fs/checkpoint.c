@@ -263,77 +263,102 @@ bool f2fs_is_valid_blkaddr_raw(struct f2fs_sb_info *sbi,
 /*
  * Readahead CP/NAT/SIT/SSA/POR pages
  */
+/*
+ * 预读（readahead）CP / NAT / SIT / SSA / POR 等元数据块
+ *  start   : 起始块号（不同类型含义不同，见下方 switch）
+ *  nrpages : 要预读的页数
+ *  type    : META_CP / META_NAT / META_SIT / META_SSA / META_POR（断电恢复）
+ *  sync    : true=同步高优先级读，false=普通预读
+ * 返回值   : 实际发起的块数（blkno - start）
+ */
 int f2fs_ra_meta_pages(struct f2fs_sb_info *sbi, block_t start, int nrpages,
 							int type, bool sync)
 {
-	block_t blkno = start;
-	struct f2fs_io_info fio = {
-		.sbi = sbi,
-		.type = META,
-		.op = REQ_OP_READ,
+	block_t blkno = start;	/* 当前处理的块号，从start开始 */
+	struct f2fs_io_info fio = {	/* IO请求信息结构体初始化 */
+		.sbi = sbi,	/* 设置超级块信息 */
+		.type = META,	/* IO类型为元数据 */
+		.op = REQ_OP_READ,	/* 操作类型为读取 */
+		/* 同步模式下设置REQ_META和REQ_PRIO标志，否则设置REQ_RAHEAD */
+		/* sync 读带 META+PRIO 标志，预读只标 REQ_RAHEAD */
+		// sync为True，也就是同步读，不再是预读
 		.op_flags = sync ? (REQ_META | REQ_PRIO) : REQ_RAHEAD,
-		.encrypted_page = NULL,
-		.in_list = 0,
-		.is_por = (type == META_POR) ? 1 : 0,
+		.encrypted_page = NULL,	/* 非加密页面 */
+		.in_list = 0,	/* 不在列表中 */
+		.is_por = (type == META_POR) ? 1 : 0,	/* 是否为断电恢复类型 */
 	};
-	struct blk_plug plug;
+	struct blk_plug plug;	/* 块设备IO请求合并插件 */
 	int err;
 
+	/* 如果是断电恢复类型，清除REQ_META标志 */
+	// 为什么？猜测为：
+	// 避免将断电恢复时的特殊数据当作正常元数据处理
+	// 防止触发不适合恢复场景的元数据IO优化
+	// 确保恢复过程使用更简单、更可靠的IO处理路径
+	// 避免与正常文件系统操作的元数据IO处理逻辑冲突
 	if (unlikely(type == META_POR))
 		fio.op_flags &= ~REQ_META;
 
+	/* 开始块设备IO请求合并 */
 	blk_start_plug(&plug);
-	for (; nrpages-- > 0; blkno++) {
-		struct folio *folio;
-
+	for (; nrpages-- > 0; blkno++) {	/* 循环处理每个要预读的页面 */
+		struct folio *folio;	/* 页面folio结构体 */
+		/* 检查块地址是否有效 */
 		if (!f2fs_is_valid_blkaddr(sbi, blkno, type))
 			goto out;
 
+		/* 根据元数据类型获取实际的块地址 */
 		switch (type) {
-		case META_NAT:
-			if (unlikely(blkno >=
+		case META_NAT:	/* 节点地址转换表元数据 */
+			if (unlikely(blkno >=	/* 如果块号超过NAT表大小，重置为0 */
 					NAT_BLOCK_OFFSET(NM_I(sbi)->max_nid)))
 				blkno = 0;
 			/* get nat block addr */
+			/* 获取当前NAT块的物理地址 */
 			fio.new_blkaddr = current_nat_addr(sbi,
 					blkno * NAT_ENTRY_PER_BLOCK);
 			break;
-		case META_SIT:
+		case META_SIT:	/* 段信息表元数据 */
+			/* 如果块号超过总段数，退出循环 */
 			if (unlikely(blkno >= TOTAL_SEGS(sbi)))
 				goto out;
 			/* get sit block addr */
+			/* 获取当前SIT块的物理地址 */
 			fio.new_blkaddr = current_sit_addr(sbi,
 					blkno * SIT_ENTRY_PER_BLOCK);
 			break;
-		case META_SSA:
-		case META_CP:
-		case META_POR:
-			fio.new_blkaddr = blkno;
+		case META_SSA:	/* 段摘要区域元数据 */
+		case META_CP:	/* 检查点元数据 */
+		case META_POR:	/* 断电恢复元数据 */
+			fio.new_blkaddr = blkno;	/* 这些类型的块号直接作为物理地址 */
 			break;
 		default:
-			BUG();
+			BUG();	/* 未知元数据类型，触发BUG */
 		}
-
+		/* 从元数据映射中获取或创建folio */
 		folio = f2fs_grab_cache_folio(META_MAPPING(sbi),
 						fio.new_blkaddr, false);
-		if (IS_ERR(folio))
+		if (IS_ERR(folio))	/* 如果获取失败，继续处理下一个块 */
 			continue;
+		/* 如果folio已经是最新的，释放并继续处理下一个块 */
 		if (folio_test_uptodate(folio)) {
 			f2fs_folio_put(folio, true);
 			continue;
 		}
-
+		/* 设置IO请求的页面 */
 		fio.page = &folio->page;
+		/* 提交IO请求 */
 		err = f2fs_submit_page_bio(&fio);
+		/* 释放folio，根据IO结果决定是否标记为脏 */
 		f2fs_folio_put(folio, err ? true : false);
 
-		if (!err)
+		if (!err)	/* 如果IO成功，更新元数据读取IO统计 */
 			f2fs_update_iostat(sbi, NULL, FS_META_READ_IO,
 							F2FS_BLKSIZE);
 	}
 out:
-	blk_finish_plug(&plug);
-	return blkno - start;
+	blk_finish_plug(&plug);	/* 结束块设备IO请求合并 */
+	return blkno - start;	/* 返回实际预读的页面数量 */
 }
 
 void f2fs_ra_meta_pages_cond(struct f2fs_sb_info *sbi, pgoff_t index,
@@ -505,11 +530,19 @@ static bool f2fs_dirty_meta_folio(struct address_space *mapping,
 	return false;
 }
 
+// 为「元数据地址空间」定义的一组页缓存（address-space）操作（address_space_operations）
+// 把“元数据”相关的页缓存事件（写回、标记脏、失效、释放、迁移）全部定向到 F2FS 自己实现的回调函数，
+// 从而保证对元数据页的寿命、一致性、原子性有完全的控制。
 const struct address_space_operations f2fs_meta_aops = {
+	/* 批量回写脏页：触发 checkpoint 写 META */
 	.writepages	= f2fs_write_meta_pages,
+	/* 标记 folio 为脏：更新 META 脏页计数 */
 	.dirty_folio	= f2fs_dirty_meta_folio,
+	/* 丢弃 folio：从 META 链表摘除 */
 	.invalidate_folio = f2fs_invalidate_folio,
+	/* 释放 folio：清理私有数据 */
 	.release_folio	= f2fs_release_folio,
+	/* 内存规整：直接用通用页迁移 */
 	.migrate_folio	= filemap_migrate_folio,
 };
 

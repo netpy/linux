@@ -3381,47 +3381,78 @@ int f2fs_flush_nat_entries(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 	return err;
 }
 
+/**
+ * __get_nat_bitmaps - 从检查点区域读取并初始化 NAT 版本位图
+ * @sbi: F2FS 超级块信息结构体指针
+ *
+ * 该函数负责从文件系统检查点区域读取 NAT（节点地址表）版本位图数据，
+ * 并在内存中进行初始化。主要功能包括：
+ * 1. 检查 NAT 位图功能是否已启用
+ * 2. 计算所需内存大小并分配内存
+ * 3. 从磁盘读取 NAT 位图数据
+ * 4. 验证位图数据的版本和 CRC 完整性
+ * 5. 初始化相关指针以便后续使用
+ * 6. 如果验证失败，禁用 NAT 位图功能
+ *
+ * 返回值：
+ * - 成功：返回 0
+ * - 内存分配失败：返回 -ENOMEM
+ * - 读取元数据页失败：返回相应的错误码
+ * - 位图验证失败：返回 0（此时已禁用 NAT 位图功能）
+ */
 static int __get_nat_bitmaps(struct f2fs_sb_info *sbi)
 {
-	struct f2fs_checkpoint *ckpt = F2FS_CKPT(sbi);
-	struct f2fs_nm_info *nm_i = NM_I(sbi);
+	struct f2fs_checkpoint *ckpt = F2FS_CKPT(sbi);	/* 检查点信息结构体指针 */
+	struct f2fs_nm_info *nm_i = NM_I(sbi);	/* 节点管理器信息结构体指针 */
+	/* 计算 NAT 位图所需的字节数（每个块用 1 位表示） */
 	unsigned int nat_bits_bytes = nm_i->nat_blocks / BITS_PER_BYTE;
-	unsigned int i;
-	__u64 cp_ver = cur_cp_version(ckpt);
-	block_t nat_bits_addr;
+	unsigned int i;	/* 循环计数器 */
+	__u64 cp_ver = cur_cp_version(ckpt);	/* 当前检查点版本号 */
+	block_t nat_bits_addr;	 /* NAT 位图在磁盘上的起始地址 */
 
+	/* 如果 NAT 位图功能未启用，直接返回 */
 	if (!enabled_nat_bits(sbi, NULL))
 		return 0;
-
+	/* 
+     * 计算 NAT 位图所需的块数：
+     * - (nat_bits_bytes << 1)：两倍的 NAT 位图字节数（存储满和空两个位图）
+     * + 8：8 字节用于存储检查点版本和 CRC
+     * F2FS_BLK_ALIGN：按块大小对齐
+     */
 	nm_i->nat_bits_blocks = F2FS_BLK_ALIGN((nat_bits_bytes << 1) + 8);
+	/* 分配内存用于存储 NAT 位图数据 */
 	nm_i->nat_bits = f2fs_kvzalloc(sbi,
 			F2FS_BLK_TO_BYTES(nm_i->nat_bits_blocks), GFP_KERNEL);
 	if (!nm_i->nat_bits)
 		return -ENOMEM;
-
+	/* 计算 NAT 位图在磁盘上的起始地址：检查点起始地址 + 段大小 - NAT 位图块数 */
 	nat_bits_addr = __start_cp_addr(sbi) + BLKS_PER_SEG(sbi) -
 						nm_i->nat_bits_blocks;
+	/* 从磁盘读取 NAT 位图数据 */
 	for (i = 0; i < nm_i->nat_bits_blocks; i++) {
-		struct folio *folio;
-
+		struct folio *folio;	/* 页帧结构体指针 */
+		/* 读取元数据页 */
 		folio = f2fs_get_meta_folio(sbi, nat_bits_addr++);
 		if (IS_ERR(folio))
 			return PTR_ERR(folio);
-
+		/* 将页数据复制到内存中的 NAT 位图缓冲区 */
 		memcpy(nm_i->nat_bits + F2FS_BLK_TO_BYTES(i),
 					folio_address(folio), F2FS_BLKSIZE);
-		f2fs_folio_put(folio, true);
+		f2fs_folio_put(folio, true);	/* 释放页帧并标记为脏 */
 	}
-
+	/* 组合检查点版本和 CRC 进行验证 */
 	cp_ver |= (cur_cp_crc(ckpt) << 32);
+	/* 验证 NAT 位图数据的版本和 CRC */
 	if (cpu_to_le64(cp_ver) != *(__le64 *)nm_i->nat_bits) {
-		disable_nat_bits(sbi, true);
+		disable_nat_bits(sbi, true);	/* 验证失败，禁用 NAT 位图功能 */
 		return 0;
 	}
-
+	/* 初始化 NAT 位图相关指针 */
+	 /* 满 NAT 块位图指针（跳过 8 字节版本信息） */
 	nm_i->full_nat_bits = nm_i->nat_bits + 8;
+	/* 空 NAT 块位图指针 */
 	nm_i->empty_nat_bits = nm_i->full_nat_bits + nat_bits_bytes;
-
+	/* 记录日志：在检查点中找到 NAT 位图 */
 	f2fs_notice(sbi, "Found nat_bits in checkpoint");
 	return 0;
 }
@@ -3460,65 +3491,91 @@ static inline void load_free_nid_bitmap(struct f2fs_sb_info *sbi)
 	}
 }
 
+/**
+ * init_node_manager - 初始化F2FS节点管理器
+ * @sbi: F2FS超级块信息指针
+ *
+ * 该函数负责初始化F2FS文件系统的节点管理器，设置NAT(节点地址表)的基本信息、
+ * 计算最大节点ID和可用节点ID数量、初始化各种数据结构和锁机制，以及加载位图信息。
+ *
+ * 返回值：成功返回0，失败返回错误码
+ */
 static int init_node_manager(struct f2fs_sb_info *sbi)
 {
-	struct f2fs_super_block *sb_raw = F2FS_RAW_SUPER(sbi);
-	struct f2fs_nm_info *nm_i = NM_I(sbi);
-	unsigned char *version_bitmap;
-	unsigned int nat_segs;
-	int err;
-
+	struct f2fs_super_block *sb_raw = F2FS_RAW_SUPER(sbi);	/* 获取原始超级块信息 */
+	struct f2fs_nm_info *nm_i = NM_I(sbi);	/* 获取节点管理器信息 */
+	unsigned char *version_bitmap;	/* 版本位图指针 */
+	unsigned int nat_segs;	/* NAT段数量 */
+	int err;	/* 错误码 */
+	/* 从超级块获取NAT表在磁盘上的起始块地址 */
 	nm_i->nat_blkaddr = le32_to_cpu(sb_raw->nat_blkaddr);
 
 	/* segment_count_nat includes pair segment so divide to 2. */
+	/* 
+	 * segment_count_nat包含了双份段(主备)，所以除以2
+	 * 使用位运算>>1替代除法，提高效率
+	 */
 	nat_segs = le32_to_cpu(sb_raw->segment_count_nat) >> 1;
+	/* 计算NAT块总数：段数 * 每段包含的块数(2^log_blocks_per_seg) */
 	nm_i->nat_blocks = nat_segs << le32_to_cpu(sb_raw->log_blocks_per_seg);
+	/* 计算最大节点ID：每个NAT块包含的条目数 * NAT块总数 */
 	nm_i->max_nid = NAT_ENTRY_PER_BLOCK * nm_i->nat_blocks;
 
 	/* not used nids: 0, node, meta, (and root counted as valid node) */
+	/* 
+	 * 计算可用节点ID数量：
+	 * 最大节点ID减去已使用的有效节点数和保留节点数
+	 * 保留节点包括：0(无效)、node(节点)、meta(元数据)等
+	 */
 	nm_i->available_nids = nm_i->max_nid - sbi->total_valid_node_count -
 						F2FS_RESERVED_NODE_NUM;
-	nm_i->nid_cnt[FREE_NID] = 0;
-	nm_i->nid_cnt[PREALLOC_NID] = 0;
-	nm_i->ram_thresh = DEF_RAM_THRESHOLD;
-	nm_i->ra_nid_pages = DEF_RA_NID_PAGES;
-	nm_i->dirty_nats_ratio = DEF_DIRTY_NAT_RATIO_THRESHOLD;
-	nm_i->max_rf_node_blocks = DEF_RF_NODE_BLOCKS;
+	/* 初始化空闲节点ID计数 */
+	nm_i->nid_cnt[FREE_NID] = 0;	/* 普通空闲节点ID计数 */
+	nm_i->nid_cnt[PREALLOC_NID] = 0;	/* 预分配节点ID计数 */
+	nm_i->ram_thresh = DEF_RAM_THRESHOLD;	/* 设置内存使用阈值 */
+	nm_i->ra_nid_pages = DEF_RA_NID_PAGES;	/* 设置节点ID页面预读数量 */
+	nm_i->dirty_nats_ratio = DEF_DIRTY_NAT_RATIO_THRESHOLD;	/* 设置脏NAT条目的比例阈值 */
+	nm_i->max_rf_node_blocks = DEF_RF_NODE_BLOCKS;	/* 设置恢复过程中最大节点块数量 */
 
+	/* 初始化空闲节点ID缓存的基数树 */
 	INIT_RADIX_TREE(&nm_i->free_nid_root, GFP_ATOMIC);
-	INIT_LIST_HEAD(&nm_i->free_nid_list);
-	INIT_RADIX_TREE(&nm_i->nat_root, GFP_NOIO);
-	INIT_RADIX_TREE(&nm_i->nat_set_root, GFP_NOIO);
-	INIT_LIST_HEAD(&nm_i->nat_entries);
-	spin_lock_init(&nm_i->nat_list_lock);
+	INIT_LIST_HEAD(&nm_i->free_nid_list);	/* 初始化空闲节点ID链表 */
+	INIT_RADIX_TREE(&nm_i->nat_root, GFP_NOIO);	/* 初始化NAT条目缓存的基数树 */
+	INIT_RADIX_TREE(&nm_i->nat_set_root, GFP_NOIO);	/* 初始化NAT集合缓存的基数树 */
+	INIT_LIST_HEAD(&nm_i->nat_entries);	/* 初始化NAT条目链表 */
+	spin_lock_init(&nm_i->nat_list_lock);	/* 初始化NAT链表的自旋锁 */
 
+	/* 初始化构建空闲节点ID的互斥锁 */
 	mutex_init(&nm_i->build_lock);
-	spin_lock_init(&nm_i->nid_list_lock);
-	init_f2fs_rwsem(&nm_i->nat_tree_lock);
+	spin_lock_init(&nm_i->nid_list_lock);	/* 初始化节点ID链表的自旋锁 */
+	init_f2fs_rwsem(&nm_i->nat_tree_lock);	/* 初始化NAT树的读写信号量 */
 
+	/* 从检查点获取下一个空闲节点ID */
 	nm_i->next_scan_nid = le32_to_cpu(sbi->ckpt->next_free_nid);
-	nm_i->bitmap_size = __bitmap_size(sbi, NAT_BITMAP);
-	version_bitmap = __bitmap_ptr(sbi, NAT_BITMAP);
+	nm_i->bitmap_size = __bitmap_size(sbi, NAT_BITMAP);	/* 计算NAT位图的大小 */
+	version_bitmap = __bitmap_ptr(sbi, NAT_BITMAP);	/* 获取NAT位图的指针 */
+	// 从CP中复制出来
 	nm_i->nat_bitmap = kmemdup(version_bitmap, nm_i->bitmap_size,
-					GFP_KERNEL);
-	if (!nm_i->nat_bitmap)
+					GFP_KERNEL);	/* 复制NAT位图到内存 */
+	if (!nm_i->nat_bitmap)	/* 检查内存分配是否成功 */
 		return -ENOMEM;
 
-	if (!test_opt(sbi, NAT_BITS))
+	if (!test_opt(sbi, NAT_BITS))	/* 如果没有启用NAT_BITS选项，则禁用NAT位图表 */
 		disable_nat_bits(sbi, true);
 
-	err = __get_nat_bitmaps(sbi);
+	err = __get_nat_bitmaps(sbi);	/* 获取NAT位图表 */
 	if (err)
 		return err;
 
 #ifdef CONFIG_F2FS_CHECK_FS
+	/* 在检查模式下，创建NAT位图的镜像 */
 	nm_i->nat_bitmap_mir = kmemdup(version_bitmap, nm_i->bitmap_size,
 					GFP_KERNEL);
-	if (!nm_i->nat_bitmap_mir)
+	if (!nm_i->nat_bitmap_mir)	/* 检查内存分配是否成功 */
 		return -ENOMEM;
 #endif
 
-	return 0;
+	return 0;	/* 初始化成功 */
 }
 
 static int init_free_nid_cache(struct f2fs_sb_info *sbi)
@@ -3554,26 +3611,51 @@ static int init_free_nid_cache(struct f2fs_sb_info *sbi)
 	return 0;
 }
 
+/**
+ * f2fs_build_node_manager - 构建F2FS文件系统的节点管理器
+ * @sbi: F2FS超级块信息结构体指针
+ *
+ * 该函数是节点管理器的完整构建入口，负责：
+ * 1. 分配节点管理器核心结构体内存
+ * 2. 初始化节点管理器的基本配置和数据结构
+ * 3. 设置空闲节点ID缓存管理
+ * 4. 加载和构建空闲节点ID位图及列表
+ *
+ * 返回值：
+ *   成功：0
+ *   失败：相应的错误码（如内存分配失败返回-ENOMEM）
+ */
 int f2fs_build_node_manager(struct f2fs_sb_info *sbi)
 {
-	int err;
+	int err;	/* 错误码变量，用于检查各步骤执行结果 */
 
+    /*
+     * 分配节点管理器核心结构体struct f2fs_nm_info
+     * f2fs_kzalloc是F2FS自定义的内存分配函数，会自动清零分配的内存
+     * GFP_KERNEL表示在进程上下文分配内存，可能睡眠
+     */
 	sbi->nm_info = f2fs_kzalloc(sbi, sizeof(struct f2fs_nm_info),
 							GFP_KERNEL);
-	if (!sbi->nm_info)
+	if (!sbi->nm_info)	/* 检查内存分配是否成功 */
 		return -ENOMEM;
 
-	err = init_node_manager(sbi);
+	err = init_node_manager(sbi);	 /* 初始化节点管理器的基本配置和数据结构 */
 	if (err)
 		return err;
-
+	 /* 初始化空闲节点ID的缓存管理结构 */
 	err = init_free_nid_cache(sbi);
 	if (err)
 		return err;
 
 	/* load free nid status from nat_bits table */
+	/* 从NAT区域的nat_bits表加载空闲节点ID的状态信息 */
 	load_free_nid_bitmap(sbi);
 
+    /*
+     * 构建空闲节点ID列表
+     * 第一个true：表示从NAT区域加载
+     * 第二个true：表示需要重新构建空闲节点ID列表
+     */
 	return f2fs_build_free_nids(sbi, true, true);
 }
 

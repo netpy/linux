@@ -1047,40 +1047,59 @@ repeat:
  * find_inode_fast is the fast path version of find_inode, see the comment at
  * iget_locked for details.
  */
+/*
+ * find_inode_fast - find_inode的快速路径版本，详细说明请参见iget_locked的注释
+ * @sb:		要查找的inode所属的超级块
+ * @head:	inode哈希表的表头指针
+ * @ino:	要查找的inode编号
+ * @is_inode_hash_locked:	指示调用者是否已经持有inode_hash_lock锁
+ *
+ * 该函数用于在inode哈希表中快速查找指定的inode。它使用RCU保护来提高查找性能，
+ * 并支持两种操作模式：调用者持有inode_hash_lock锁或不持有该锁。
+ *
+ * 返回值：
+ *   - 成功：返回指向找到的inode的指针（引用计数已增加）
+ *   - 未找到：返回NULL
+ *   - 错误：返回错误指针（ERR_PTR），表示inode正在创建中
+ */
 static struct inode *find_inode_fast(struct super_block *sb,
 				struct hlist_head *head, unsigned long ino,
 				bool is_inode_hash_locked)
 {
 	struct inode *inode = NULL;
 
-	if (is_inode_hash_locked)
-		lockdep_assert_held(&inode_hash_lock);
+	if (is_inode_hash_locked)	/* 验证锁的状态是否符合预期 */
+		lockdep_assert_held(&inode_hash_lock);	/* 应该持有inode_hash_lock */
 	else
-		lockdep_assert_not_held(&inode_hash_lock);
+		lockdep_assert_not_held(&inode_hash_lock);	/* 不应该持有inode_hash_lock */
 
-	rcu_read_lock();
+	rcu_read_lock();	/* 获取RCU读锁，保护哈希表遍历 */
 repeat:
+	/* 使用RCU保护的方式遍历哈希表中的inode条目 */
 	hlist_for_each_entry_rcu(inode, head, i_hash) {
-		if (inode->i_ino != ino)
+		if (inode->i_ino != ino)	/* 检查inode编号是否匹配 */
 			continue;
-		if (inode->i_sb != sb)
+		if (inode->i_sb != sb)	/* 检查超级块是否匹配 */
 			continue;
-		spin_lock(&inode->i_lock);
+		spin_lock(&inode->i_lock);	/* 持有inode的i_lock，保护inode状态 */
+		/* 检查inode是否正在被释放 */
 		if (inode->i_state & (I_FREEING|I_WILL_FREE)) {
+			/* 等待inode释放完成，然后重新尝试查找 */
 			__wait_on_freeing_inode(inode, is_inode_hash_locked);
 			goto repeat;
 		}
+		/* 检查inode是否正在被创建（罕见情况） */
 		if (unlikely(inode->i_state & I_CREATING)) {
 			spin_unlock(&inode->i_lock);
 			rcu_read_unlock();
-			return ERR_PTR(-ESTALE);
+			return ERR_PTR(-ESTALE);	/* 返回错误，指示inode状态过时 */
 		}
-		__iget(inode);
-		spin_unlock(&inode->i_lock);
-		rcu_read_unlock();
-		return inode;
+		__iget(inode);	/* 增加inode的引用计数 */
+		spin_unlock(&inode->i_lock);	/* 释放inode的i_lock */
+		rcu_read_unlock();	/* 释放RCU读锁 */
+		return inode;	/* 返回找到的inode */
 	}
-	rcu_read_unlock();
+	rcu_read_unlock();	/* 未找到匹配的inode，释放RCU读锁并返回NULL */
 	return NULL;
 }
 
@@ -1419,43 +1438,58 @@ EXPORT_SYMBOL_GPL(iget5_locked_rcu);
  * hashed, and with the I_NEW flag set.  The file system gets to fill it in
  * before unlocking it via unlock_new_inode().
  */
+/**
+ * iget_locked - 从已挂载的文件系统获取inode
+ * @sb:		文件系统的超级块
+ * @ino:	要获取的inode编号
+ *
+ * 在inode缓存中搜索由@ino指定的inode，如果存在则返回它并增加引用计数。
+ * 这适用于inode编号足以唯一标识inode的文件系统。
+ *
+ * 如果inode不在缓存中，则分配一个新的inode并返回，返回时inode处于锁定状态、
+ * 已添加到哈希表，并设置了I_NEW标志。文件系统需要在通过unlock_new_inode()解锁之前
+ * 填充inode的内容。
+ */
 struct inode *iget_locked(struct super_block *sb, unsigned long ino)
 {
-	struct hlist_head *head = inode_hashtable + hash(sb, ino);
+	struct hlist_head *head = inode_hashtable + hash(sb, ino);	/* 计算inode在哈希表中的位置 */
 	struct inode *inode;
 again:
-	inode = find_inode_fast(sb, head, ino, false);
+	inode = find_inode_fast(sb, head, ino, false);	/* 快速查找inode（无锁，仅检查rcu保护的哈希表） */
 	if (inode) {
-		if (IS_ERR(inode))
+		if (IS_ERR(inode))	/* 检查inode是否为错误指针 */
 			return NULL;
-		wait_on_inode(inode);
+		wait_on_inode(inode);	/* 等待inode上的I/O操作完成 */
+		/* 检查inode是否已从哈希表中移除（罕见情况） */
 		if (unlikely(inode_unhashed(inode))) {
-			iput(inode);
-			goto again;
+			iput(inode);	/* 释放inode引用 */
+			goto again;		/* 重新尝试查找 */
 		}
-		return inode;
+		return inode;	/* 返回找到的inode（引用计数已增加） */
 	}
-
+	/* 分配新inode结构 */
 	inode = alloc_inode(sb);
 	if (inode) {
-		struct inode *old;
+		struct inode *old;	/* 用于检查竞态条件的变量 */
 
-		spin_lock(&inode_hash_lock);
+		spin_lock(&inode_hash_lock);	/* 持有inode哈希表锁，保护哈希表操作 */
 		/* We released the lock, so.. */
+		// 重新检查inode是否已存在（在我们分配inode期间可能已被其他进程创建）
+		// 第二个参数true表示即使inode处于I_NEW状态也返回
 		old = find_inode_fast(sb, head, ino, true);
-		if (!old) {
-			inode->i_ino = ino;
-			spin_lock(&inode->i_lock);
-			inode->i_state = I_NEW;
-			hlist_add_head_rcu(&inode->i_hash, head);
+		if (!old) {	/* 无竞态，初始化新inode */
+			inode->i_ino = ino;	/* 设置inode号 */
+			spin_lock(&inode->i_lock);	/* 保护inode状态设置 */
+			inode->i_state = I_NEW;	/* 标记为新inode，需要填充内容 */
+			hlist_add_head_rcu(&inode->i_hash, head);	/* 添加到哈希表 */
 			spin_unlock(&inode->i_lock);
 			spin_unlock(&inode_hash_lock);
-			inode_sb_list_add(inode);
+			inode_sb_list_add(inode);	/* 将inode添加到超级块的inode列表中 */
 
 			/* Return the locked inode with I_NEW set, the
 			 * caller is responsible for filling in the contents
 			 */
-			return inode;
+			return inode;	/* 返回锁定的新inode，调用者需要填充内容后调用unlock_new_inode() */
 		}
 
 		/*
@@ -1463,18 +1497,23 @@ again:
 		 * us. Use the old inode instead of the one we just
 		 * allocated.
 		 */
+		/*
+		 * 竞态条件：另一个进程已经创建了相同的inode
+		 * 释放我们刚刚分配的inode，使用已存在的inode
+		 */
 		spin_unlock(&inode_hash_lock);
-		destroy_inode(inode);
-		if (IS_ERR(old))
+		destroy_inode(inode);	/* 销毁我们分配的未使用inode */
+		if (IS_ERR(old))	/* 检查已存在的inode是否为错误指针 */
 			return NULL;
-		inode = old;
-		wait_on_inode(inode);
+		inode = old;	/* 使用已存在的inode */
+		wait_on_inode(inode);	/* 等待inode上的I/O操作完成 */
+		/* 检查inode是否已从哈希表中移除（罕见情况） */
 		if (unlikely(inode_unhashed(inode))) {
-			iput(inode);
-			goto again;
+			iput(inode);	/* 释放inode引用 */
+			goto again;	/* 重新尝试查找 */
 		}
 	}
-	return inode;
+	return inode;	/* 返回inode（可能为NULL，如果分配失败） */
 }
 EXPORT_SYMBOL(iget_locked);
 
@@ -2431,31 +2470,49 @@ EXPORT_SYMBOL(inode_needs_sync);
  * wake_up_bit(&inode->i_state, __I_NEW) after removing from the hash list
  * will DTRT.
  */
+/*
+ * __wait_on_freeing_inode - 等待正在被删除的inode完成删除操作
+ * @inode: 正在被删除的inode指针
+ * @is_inode_hash_locked: 指示调用者是否已经持有inode_hash_lock锁
+ *
+ * 当我们尝试在inode哈希表中查找一个正在被删除的inode时，必须等待文件系统
+ * 完成其删除操作后才能报告该inode不存在。此函数等待删除操作*可能*已经完成。
+ * 调用者负责重新检查inode的状态。
+ *
+ * 最初是否设置了I_NEW标志并不重要，在从哈希列表中移除后调用
+ * wake_up_bit(&inode->i_state, __I_NEW)会正确处理。
+ */
 static void __wait_on_freeing_inode(struct inode *inode, bool is_inode_hash_locked)
 {
-	struct wait_bit_queue_entry wqe;
-	struct wait_queue_head *wq_head;
+	struct wait_bit_queue_entry wqe;	/* 等待队列条目 */
+	struct wait_queue_head *wq_head;	/* 等待队列头 */
 
 	/*
 	 * Handle racing against evict(), see that routine for more details.
 	 */
+	// 处理与evict()的竞争，有关更多详细信息，请参见该例程。
+	// 如果inode已经从哈希表中移除，则无需等待。
 	if (unlikely(inode_unhashed(inode))) {
-		WARN_ON(is_inode_hash_locked);
-		spin_unlock(&inode->i_lock);
+		WARN_ON(is_inode_hash_locked);	/* 如果持有inode_hash_lock锁，则发出警告，因为这是意外情况 */
+		spin_unlock(&inode->i_lock);	/* 释放inode的i_lock */
 		return;
 	}
-
+	/* 获取inode状态位的等待队列头 */
 	wq_head = inode_bit_waitqueue(&wqe, inode, __I_NEW);
+	/* 准备等待事件，设置任务为不可中断状态 */
 	prepare_to_wait_event(wq_head, &wqe.wq_entry, TASK_UNINTERRUPTIBLE);
-	spin_unlock(&inode->i_lock);
-	rcu_read_unlock();
+	spin_unlock(&inode->i_lock);	/* 释放inode的i_lock，允许其他进程操作该inode */
+	rcu_read_unlock();	/* 释放RCU读锁，允许RCU回调执行 */
+	/* 如果持有inode_hash_lock锁，则在此处释放它，避免死锁 */
 	if (is_inode_hash_locked)
 		spin_unlock(&inode_hash_lock);
-	schedule();
+	schedule();	/* 调度切换，让当前任务进入睡眠状态，等待唤醒 */
+	/* 完成等待，清理等待队列条目 */
 	finish_wait(wq_head, &wqe.wq_entry);
+	/* 如果之前持有inode_hash_lock锁，则重新获取它 */
 	if (is_inode_hash_locked)
 		spin_lock(&inode_hash_lock);
-	rcu_read_lock();
+	rcu_read_lock();	/* 重新获取RCU读锁，恢复之前的RCU保护状态 */
 }
 
 static __initdata unsigned long ihash_entries;

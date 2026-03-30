@@ -583,90 +583,113 @@ static bool is_meta_ino(struct f2fs_sb_info *sbi, unsigned int ino)
 		ino == F2FS_COMPRESS_INO(sbi);
 }
 
+/**
+ * f2fs_iget - 根据inode号获取或创建F2FS文件系统的inode
+ * @sb: 超级块指针，指向当前F2FS文件系统
+ * @ino: 要获取的inode号
+ *
+ * 该函数是F2FS文件系统中inode管理的核心函数，负责根据inode号从磁盘加载inode信息
+ * 或从缓存中获取已存在的inode。它处理不同类型的inode（元数据inode、常规文件、目录、
+ * 符号链接、特殊设备文件等），并为它们设置相应的操作函数和属性。
+ *
+ * 返回值：
+ *   - 成功：返回指向inode结构体的指针
+ *   - 失败：返回错误指针（ERR_PTR），错误码包括：
+ *     - -ENOMEM：内存分配失败
+ *     - -EFSCORRUPTED：文件系统损坏（元数据inode访问错误）
+ *     - -EIO：inode读取失败或未知inode类型
+ */
 struct inode *f2fs_iget(struct super_block *sb, unsigned long ino)
 {
-	struct f2fs_sb_info *sbi = F2FS_SB(sb);
-	struct inode *inode;
-	int ret = 0;
+	struct f2fs_sb_info *sbi = F2FS_SB(sb);	/* 获取F2FS超级块信息 */
+	struct inode *inode;	/* 指向要返回的inode */
+	int ret = 0;	/* 错误码 */
 
+	/* 从inode缓存中获取或创建一个锁定的inode */
 	inode = iget_locked(sb, ino);
 	if (!inode)
-		return ERR_PTR(-ENOMEM);
+		return ERR_PTR(-ENOMEM);	/* 内存分配失败 */
 
+	/* 如果inode不是新创建的（已存在于缓存中） */
 	if (!(inode->i_state & I_NEW)) {
-		if (is_meta_ino(sbi, ino)) {
+		if (is_meta_ino(sbi, ino)) {	/* 检查是否为元数据inode */
+			/* 元数据inode不应该在缓存中直接访问，需要fsck修复 */
 			f2fs_err(sbi, "inaccessible inode: %lu, run fsck to repair", ino);
-			set_sbi_flag(sbi, SBI_NEED_FSCK);
+			set_sbi_flag(sbi, SBI_NEED_FSCK);	/* 设置需要fsck的标志 */
 			ret = -EFSCORRUPTED;
-			trace_f2fs_iget_exit(inode, ret);
-			iput(inode);
-			f2fs_handle_error(sbi, ERROR_CORRUPTED_INODE);
+			trace_f2fs_iget_exit(inode, ret);	/* 跟踪退出 */
+			iput(inode);	/* 释放inode引用 */
+			f2fs_handle_error(sbi, ERROR_CORRUPTED_INODE);	/* 处理错误 */
 			return ERR_PTR(ret);
 		}
 
-		trace_f2fs_iget(inode);
+		trace_f2fs_iget(inode);	/* 非元数据inode，直接返回 */
 		return inode;
 	}
 
+	/* 处理新创建的inode */
 	if (is_meta_ino(sbi, ino))
-		goto make_now;
+		goto make_now;	/* 元数据inode不需要从磁盘读取 */
 
+	/* 从磁盘读取inode数据 */
 	ret = do_read_inode(inode);
 	if (ret)
-		goto bad_inode;
+		goto bad_inode;	/* 读取失败，跳转到错误处理 */
 make_now:
+	/* 根据inode号和类型设置相应的操作函数和属性 */
+	/* 节点inode - 存储文件系统节点信息 */
 	if (ino == F2FS_NODE_INO(sbi)) {
-		inode->i_mapping->a_ops = &f2fs_node_aops;
-		mapping_set_gfp_mask(inode->i_mapping, GFP_NOFS);
-	} else if (ino == F2FS_META_INO(sbi)) {
+		inode->i_mapping->a_ops = &f2fs_node_aops;	/* 设置地址空间操作 */
+		mapping_set_gfp_mask(inode->i_mapping, GFP_NOFS);	/* 设置内存分配掩码 */
+	} else if (ino == F2FS_META_INO(sbi)) {	/* 元数据inode - 存储文件系统元数据 */
 		inode->i_mapping->a_ops = &f2fs_meta_aops;
 		mapping_set_gfp_mask(inode->i_mapping, GFP_NOFS);
-	} else if (ino == F2FS_COMPRESS_INO(sbi)) {
+	} else if (ino == F2FS_COMPRESS_INO(sbi)) {	/* 压缩inode - 用于文件压缩功能 */
 #ifdef CONFIG_F2FS_FS_COMPRESSION
 		inode->i_mapping->a_ops = &f2fs_compress_aops;
 		/*
 		 * generic_error_remove_folio only truncates pages of regular
 		 * inode
 		 */
-		inode->i_mode |= S_IFREG;
+		inode->i_mode |= S_IFREG;	/* generic_error_remove_folio只处理常规文件的页面截断 */
 #endif
 		mapping_set_gfp_mask(inode->i_mapping,
 			GFP_NOFS | __GFP_HIGHMEM | __GFP_MOVABLE);
-	} else if (S_ISREG(inode->i_mode)) {
-		inode->i_op = &f2fs_file_inode_operations;
-		inode->i_fop = &f2fs_file_operations;
-		inode->i_mapping->a_ops = &f2fs_dblock_aops;
-	} else if (S_ISDIR(inode->i_mode)) {
-		inode->i_op = &f2fs_dir_inode_operations;
-		inode->i_fop = &f2fs_dir_operations;
-		inode->i_mapping->a_ops = &f2fs_dblock_aops;
-		mapping_set_gfp_mask(inode->i_mapping, GFP_NOFS);
-	} else if (S_ISLNK(inode->i_mode)) {
-		if (file_is_encrypt(inode))
+	} else if (S_ISREG(inode->i_mode)) {	/* 常规文件inode */
+		inode->i_op = &f2fs_file_inode_operations;	/* inode操作 */
+		inode->i_fop = &f2fs_file_operations;	/* 文件操作 */
+		inode->i_mapping->a_ops = &f2fs_dblock_aops;	/* 数据块地址空间操作 */
+	} else if (S_ISDIR(inode->i_mode)) {	/* 目录inode */
+		inode->i_op = &f2fs_dir_inode_operations;	/* inode操作 */
+		inode->i_fop = &f2fs_dir_operations;	/* 文件操作 */
+		inode->i_mapping->a_ops = &f2fs_dblock_aops;	/* 数据块地址空间操作 */
+		mapping_set_gfp_mask(inode->i_mapping, GFP_NOFS);	/* 设置内存分配掩码 */
+	} else if (S_ISLNK(inode->i_mode)) {	/* 符号链接inode */
+		if (file_is_encrypt(inode))	/* 加密符号链接inode */
 			inode->i_op = &f2fs_encrypted_symlink_inode_operations;
-		else
+		else	/* 普通符号链接 */
 			inode->i_op = &f2fs_symlink_inode_operations;
-		inode_nohighmem(inode);
+		inode_nohighmem(inode);	/* 符号链接不在高端内存中 */
 		inode->i_mapping->a_ops = &f2fs_dblock_aops;
 	} else if (S_ISCHR(inode->i_mode) || S_ISBLK(inode->i_mode) ||
 			S_ISFIFO(inode->i_mode) || S_ISSOCK(inode->i_mode)) {
-		inode->i_op = &f2fs_special_inode_operations;
-		init_special_inode(inode, inode->i_mode, inode->i_rdev);
+		inode->i_op = &f2fs_special_inode_operations;	/* 特殊设备文件inode */
+		init_special_inode(inode, inode->i_mode, inode->i_rdev);	/* 初始化特殊inode */
 	} else {
-		ret = -EIO;
+		ret = -EIO;	/* 未知inode类型 */
 		goto bad_inode;
 	}
-	f2fs_set_inode_flags(inode);
+	f2fs_set_inode_flags(inode);	/* 设置inode标志（如S_ISUID、S_ISGID等的处理） */
 
-	unlock_new_inode(inode);
-	trace_f2fs_iget(inode);
+	unlock_new_inode(inode);	/* 解锁新inode，使其可用 */
+	trace_f2fs_iget(inode);		/* 跟踪inode获取成功 */
 	return inode;
 
-bad_inode:
-	f2fs_inode_synced(inode);
-	iget_failed(inode);
-	trace_f2fs_iget_exit(inode, ret);
-	return ERR_PTR(ret);
+bad_inode:	/* 处理inode错误 */
+	f2fs_inode_synced(inode);	/* 标记inode已同步 */
+	iget_failed(inode);	/* 通知iget系统inode初始化失败 */
+	trace_f2fs_iget_exit(inode, ret);/* 跟踪错误退出 */
+	return ERR_PTR(ret);	/* 返回错误指针 */
 }
 
 struct inode *f2fs_iget_retry(struct super_block *sb, unsigned long ino)

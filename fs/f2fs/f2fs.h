@@ -958,45 +958,86 @@ enum nat_state {
 	MAX_NAT_STATE,
 };
 
+/**
+ * struct f2fs_nm_info - F2FS节点管理信息结构体
+ * 
+ * 这个结构体包含F2FS文件系统中节点管理的所有核心信息，包括：
+ * - NAT（节点地址表）的基本信息和缓存管理
+ * - 空闲节点ID的管理
+ * - 检查点相关的位图信息
+ * 
+ * 节点管理是F2FS的核心功能之一，负责维护节点ID到物理块地址的映射关系，
+ * 以及管理节点ID的分配和回收。
+ */
 struct f2fs_nm_info {
+	/* NAT表在磁盘上的起始块地址 */
 	block_t nat_blkaddr;		/* base disk address of NAT */
+	/* 系统中最大可能的节点ID */
 	nid_t max_nid;			/* maximum possible node ids */
+	/* 当前可用的节点ID数量 */
 	nid_t available_nids;		/* # of available node ids */
+	/* 下一次扫描空闲节点ID的起始位置 */
 	nid_t next_scan_nid;		/* the next nid to be scanned */
+	/* 恢复过程中最大允许的节点块数量 */
 	nid_t max_rf_node_blocks;	/* max # of nodes for recovery */
+	/* 控制节点管理的内存占用阈值 */
 	unsigned int ram_thresh;	/* control the memory footprint */
+	/* 预读节点ID页面的数量 */
 	unsigned int ra_nid_pages;	/* # of nid pages to be readaheaded */
+	/* 控制脏NAT条目的比例阈值 */
 	unsigned int dirty_nats_ratio;	/* control dirty nats ratio threshold */
 
 	/* NAT cache management */
+	/* NAT条目缓存的基数树根节点，用于快速查找 */
 	struct radix_tree_root nat_root;/* root of the nat entry cache */
+	/* NAT集合缓存的基数树根节点，管理NAT块集合 */
 	struct radix_tree_root nat_set_root;/* root of the nat set cache */
+	/* 保护nat_root基数树的读写信号量 */
 	struct f2fs_rwsem nat_tree_lock;	/* protect nat entry tree */
+	/* 缓存的干净NAT条目链表 */
 	struct list_head nat_entries;	/* cached nat entry list (clean) */
+	/* 保护nat_entries链表的自旋锁 */
 	spinlock_t nat_list_lock;	/* protect clean nat entry list */
+	/* 不同状态下缓存的NAT条目数量 */
 	unsigned int nat_cnt[MAX_NAT_STATE]; /* the # of cached nat entries */
+	/* 当前系统中的NAT块总数 */
 	unsigned int nat_blocks;	/* # of nat blocks */
 
 	/* free node ids management */
+	/* 空闲节点ID缓存的基数树根节点 */
 	struct radix_tree_root free_nid_root;/* root of the free_nid cache */
+	/* 空闲节点ID链表（不包含预分配的ID） */
 	struct list_head free_nid_list;		/* list for free nids excluding preallocated nids */
+	/* 不同状态下的空闲节点ID数量 */
 	unsigned int nid_cnt[MAX_NID_STATE];	/* the number of free node id */
+	/* 保护nid链表操作的自旋锁 */
 	spinlock_t nid_list_lock;	/* protect nid lists ops */
+	/* 构建空闲节点ID时的互斥锁 */
 	struct mutex build_lock;	/* lock for build free nids */
+	/* 空闲节点ID的位图数组 */
 	unsigned char **free_nid_bitmap;
+	/* NAT块的状态位图 */
 	unsigned char *nat_block_bitmap;
+	/* 每个NAT块中的空闲节点ID计数 */
 	unsigned short *free_nid_count;	/* free nid count of NAT block */
 
 	/* for checkpoint */
+	/* NAT位图指针，用于检查点 */
 	char *nat_bitmap;		/* NAT bitmap pointer */
 
+	/* NAT位图表的块数量 */
 	unsigned int nat_bits_blocks;	/* # of nat bits blocks */
+	/* NAT位图表，记录NAT块的状态 */
 	unsigned char *nat_bits;	/* NAT bits blocks */
+	/* 记录满NAT页的位图 */
 	unsigned char *full_nat_bits;	/* full NAT pages */
+	/* 记录空NAT页的位图 */
 	unsigned char *empty_nat_bits;	/* empty NAT pages */
 #ifdef CONFIG_F2FS_CHECK_FS
+	/* NAT位图的镜像，用于文件系统检查 */
 	char *nat_bitmap_mir;		/* NAT bitmap mirror */
 #endif
+	/* 位图的大小 */
 	int bitmap_size;		/* bitmap size */
 };
 
@@ -2260,25 +2301,46 @@ static inline void f2fs_up_write(struct f2fs_rwsem *sem)
 #endif
 }
 
+/**
+ * disable_nat_bits - 禁用 NAT 版本位图功能
+ * @sbi: F2FS 超级块信息结构体指针
+ * @lock: 是否需要获取/释放 cp_lock 自旋锁
+ *
+ * 该函数用于禁用 NAT（节点地址表）版本位图功能，主要执行以下操作：
+ * 1. 清除检查点中的 CP_NAT_BITS_FLAG 标志位
+ * 2. 释放 NAT 位图占用的内存
+ * 3. 将节点管理器中的 nat_bits 指针置为 NULL
+ *
+ * 注意：一旦禁用 NAT 位图功能，需要通过 fsck.f2fs 工具重新启用，但这会带来较大开销。
+ * 因此，系统设计上依赖于常规的文件系统检查或非正常关闭后的恢复机制。
+ */
 static inline void disable_nat_bits(struct f2fs_sb_info *sbi, bool lock)
 {
-	unsigned long flags;
-	unsigned char *nat_bits;
+	unsigned long flags;	/* 用于保存和恢复中断状态 */
+	unsigned char *nat_bits;	/* 临时保存 nat_bits 指针，以便后续释放内存 */
 
 	/*
 	 * In order to re-enable nat_bits we need to call fsck.f2fs by
 	 * set_sbi_flag(sbi, SBI_NEED_FSCK). But it may give huge cost,
 	 * so let's rely on regular fsck or unclean shutdown.
 	 */
-
+    /*
+     * 为了重新启用 nat_bits，我们需要通过 set_sbi_flag(sbi, SBI_NEED_FSCK)
+     * 调用 fsck.f2fs，但这会带来巨大的开销，因此我们依赖于常规的 fsck
+     * 或非正常关闭后的恢复机制。
+     */
+	/* 如果需要锁定，则获取检查点锁并保存中断状态 */
 	if (lock)
 		spin_lock_irqsave(&sbi->cp_lock, flags);
+	/* 清除检查点中的 CP_NAT_BITS_FLAG 标志位，禁用 NAT 位图功能 */
 	__clear_ckpt_flags(F2FS_CKPT(sbi), CP_NAT_BITS_FLAG);
-	nat_bits = NM_I(sbi)->nat_bits;
+	nat_bits = NM_I(sbi)->nat_bits;	/* 保存 nat_bits 指针以便后续释放 */
+	/* 将节点管理器中的 nat_bits 指针置为 NULL，防止后续访问无效内存 */
 	NM_I(sbi)->nat_bits = NULL;
+	/* 如果需要锁定，则释放检查点锁并恢复中断状态 */
 	if (lock)
 		spin_unlock_irqrestore(&sbi->cp_lock, flags);
-
+	/* 释放 NAT 位图占用的内存 */
 	kvfree(nat_bits);
 }
 
@@ -2653,17 +2715,36 @@ static inline block_t discard_blocks(struct f2fs_sb_info *sbi)
 	return sbi->discard_blks;
 }
 
+/**
+ * __bitmap_size - 获取F2FS文件系统位图的字节大小
+ * @sbi: F2FS超级块信息结构体指针，包含文件系统的核心元数据
+ * @flag: 位图类型标志，用于指定要获取哪种位图的大小：
+ *        - NAT_BITMAP: 获取NAT(节点地址转换表)版本位图大小
+ *        - SIT_BITMAP: 获取SIT(段信息表)版本位图大小
+ *
+ * 该内联函数用于从文件系统检查点中获取指定类型位图的大小。
+ * F2FS使用位图来跟踪元数据结构的版本信息，确保文件系统的一致性。
+ * 位图大小存储在检查点区域中，以小端字节序保存，因此需要转换为CPU字节序。
+ *
+ * 返回值：
+ *   成功：返回指定类型位图的字节大小（转换为CPU字节序后）
+ *   失败：如果flag参数无效，返回0
+ */
 static inline unsigned long __bitmap_size(struct f2fs_sb_info *sbi, int flag)
 {
+	/* 获取当前文件系统检查点信息，包含位图大小等元数据 */
 	struct f2fs_checkpoint *ckpt = F2FS_CKPT(sbi);
 
 	/* return NAT or SIT bitmap */
+	/* 根据指定的位图类型返回相应的位图大小 */
 	if (flag == NAT_BITMAP)
+		/* 返回NAT版本位图大小，从磁盘字节序转换为CPU字节序 */
 		return le32_to_cpu(ckpt->nat_ver_bitmap_bytesize);
 	else if (flag == SIT_BITMAP)
+		/* 返回SIT版本位图大小，从磁盘字节序转换为CPU字节序 */
 		return le32_to_cpu(ckpt->sit_ver_bitmap_bytesize);
 
-	return 0;
+	return 0;	/* 如果flag参数无效，返回0 */
 }
 
 static inline block_t __cp_payload(struct f2fs_sb_info *sbi)
@@ -2671,28 +2752,66 @@ static inline block_t __cp_payload(struct f2fs_sb_info *sbi)
 	return le32_to_cpu(F2FS_RAW_SUPER(sbi)->cp_payload);
 }
 
+/**
+ * __bitmap_ptr - 获取F2FS文件系统指定类型位图在内存中的指针
+ * @sbi: F2FS超级块信息结构体指针，包含文件系统的核心元数据
+ * @flag: 位图类型标志，用于指定要获取哪种位图的指针：
+ *        - NAT_BITMAP: 获取NAT(节点地址转换表)版本位图指针
+ *        - SIT_BITMAP: 获取SIT(段信息表)版本位图指针
+ *
+ * 该内联函数用于根据不同的文件系统配置，定位并返回指定类型位图在内存中的准确位置。
+ * F2FS使用位图来跟踪元数据结构的版本信息，确保文件系统的一致性。
+ * 位图的存储位置会根据文件系统是否启用了大NAT位图特性和检查点载荷大小而变化。
+ *
+ * 返回值：
+ *   成功：返回指定类型位图在内存中的指针
+ *   失败：根据不同的错误路径可能返回空指针（实际代码中应该总是返回有效指针）
+ */
 static inline void *__bitmap_ptr(struct f2fs_sb_info *sbi, int flag)
 {
+	/* 获取当前文件系统检查点信息，包含位图等元数据 */
 	struct f2fs_checkpoint *ckpt = F2FS_CKPT(sbi);
+	/* tmp_ptr初始指向检查点中的sit_nat_version_bitmap字段 */
 	void *tmp_ptr = &ckpt->sit_nat_version_bitmap;
-	int offset;
+	int offset;	/* 偏移量变量，用于计算位图的最终位置 */
 
+	/* 情况1：检查是否启用了大NAT位图特性 */
 	if (is_set_ckpt_flags(sbi, CP_LARGE_NAT_BITMAP_FLAG)) {
+        /*
+         * 计算偏移量：
+         * - 如果请求的是SIT位图，偏移量为NAT位图的大小
+         * - 如果请求的是NAT位图，偏移量为0
+         */
 		offset = (flag == SIT_BITMAP) ?
 			le32_to_cpu(ckpt->nat_ver_bitmap_bytesize) : 0;
 		/*
 		 * if large_nat_bitmap feature is enabled, leave checksum
 		 * protection for all nat/sit bitmaps.
 		 */
+        /*
+         * 当启用大NAT位图特性时，所有nat/sit位图都有校验和保护
+         * 因此需要跳过校验和字段（大小为__le32类型，即4字节）
+         */
 		return tmp_ptr + offset + sizeof(__le32);
 	}
-
+	/* 情况2：检查检查点载荷大小是否大于0 */
 	if (__cp_payload(sbi) > 0) {
+		/*
+         * 当检查点载荷大于0时：
+         * - NAT位图直接从tmp_ptr开始
+         * - SIT位图位于下一个块的起始位置（偏移一个块大小）
+         */
 		if (flag == NAT_BITMAP)
 			return tmp_ptr;
 		else
 			return (unsigned char *)ckpt + F2FS_BLKSIZE;
 	} else {
+        /*
+         * 情况3：检查点载荷为0时：
+         * 计算偏移量：
+         * - 如果请求的是NAT位图，偏移量为SIT位图的大小
+         * - 如果请求的是SIT位图，偏移量为0
+         */
 		offset = (flag == NAT_BITMAP) ?
 			le32_to_cpu(ckpt->sit_ver_bitmap_bytesize) : 0;
 		return tmp_ptr + offset;
